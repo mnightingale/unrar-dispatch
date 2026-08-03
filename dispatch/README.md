@@ -6,6 +6,17 @@ vendored upstream source**.
 
 `git status` shows no changes to any tracked file. Everything lives here.
 
+## Outcome (both architectures measured)
+
+| Arch | Result | Action |
+| --- | --- | --- |
+| **Linux aarch64** | Hardware CRC32 and AES are compiled *out* of stock builds. Up to **5.2x** faster with them. | **Add `-march=armv8-a+crc+crypto`.** One binary, no dispatcher. |
+| **macOS arm64** | Already enabled by default. | **None** — adding `-march` would *regress* it (drops the ARMv8.5 baseline). |
+| **x86-64** | v2/v3 make no measurable difference; hardware AES was already runtime-dispatched. | **None** — keep the single baseline binary. Do not ship the dispatcher. |
+
+The x86-64 dispatcher is complete and tested, and is kept for reuse — but the
+measurements say not to deploy it. The actionable change is the aarch64 flag.
+
 ## Why this works without touching upstream
 
 The vendored makefile's compile rule is
@@ -114,23 +125,33 @@ baseline (`__ARM_FEATURE_ATOMICS`/LSE, `DOTPROD`, `RCPC`, `PAUTH`, `BTI`,
 `SHA3`, `SHA512`, `FP16_*`). `build-variants.sh` probes for this and skips the
 flag automatically — do not "fix" it later.
 
-### x86-64 — no measurable win; do not ship the dispatcher on this evidence
+### x86-64 — settled: no measurable win, do not ship the dispatcher
 
-Measured on x86-64 with a 64 MB corpus, min-of-5, all three levels:
+Measured on x86-64, 256 MB corpus, min-of-7 after warmup, all three levels
+(Δ is v3 vs baseline):
 
-| Corpus archive | x86-64 | v2 | v3 | Δ (v3 vs base) |
-| --- | ---: | ---: | ---: | ---: |
-| `rar5-encrypted` | 129 ms | 124 ms | 124 ms | +3.9% |
-| `rar5-store-m0` | 24 ms | 23 ms | 22 ms | +8.3% |
-| `rar5-text-m5` | 92 ms | 92 ms | 90 ms | +2.2% |
-| `rar5-solid-m5` | 54 ms | 55 ms | 54 ms | 0.0% |
-| `rar5-many-m5` | 190 ms | 189 ms | 190 ms | 0.0% |
-| `rar5-exe-m5` | 200 ms | 202 ms | 205 ms | −2.5% |
-| `rar5-vol.part01` | 205 ms | 209 ms | 211 ms | −2.9% |
+| Corpus archive | x86-64 | v2 | v3 | Δ | noise | verdict |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| `rar5-encrypted-m0` | 172 ms | 168 ms | 170 ms | +1.2% | 3.2% | noise |
+| `rar5-encrypted` | 440 ms | 440 ms | 441 ms | −0.2% | 2.3% | noise |
+| `rar5-exe-m5` | 843 ms | 842 ms | 834 ms | +1.1% | 1.5% | noise |
+| `rar5-text-m5` | 393 ms | 389 ms | 401 ms | −2.0% | 5.9% | noise |
+| `rar5-many-m5` | 188 ms | 188 ms | 193 ms | −2.7% | 3.7% | noise |
+| `rar5-store-m0` | 84 ms | 85 ms | 84 ms | 0.0% | 3.9% | noise |
+| `rar5-solid-m5` | 51 ms | 54 ms | 51 ms | 0.0% | 3.4% | noise |
+| `rar5-vol.part01` | 870 ms | 883 ms | 857 ms | +1.5% | 1.0% | FASTER |
 
-Several deltas are *negative* and all are within a few percent — the signature
-of noise, not effect. Absolute times were small enough (10–200 ms) that a 2-3%
-delta is a handful of milliseconds.
+Fifteen of sixteen rows (both thread modes) are `noise` or `SLOWER`. The lone
+`FASTER` is +1.5% at 1.0% noise, and the same archive goes *slower* at default
+thread count. **This is a null result.**
+
+`rar5-encrypted-m0` is the informative one: on aarch64 it is the single
+biggest effect in this study (+80.6%), and on x86-64 it is flat. That is the
+whole asymmetry in one line — `os.hpp:80` enables `USE_SSE` on any x86 build
+and AES-NI is then chosen at runtime (`rijndael.cpp:109`), so x86 users
+already had hardware crypto. `os.hpp:163` gates the NEON equivalents behind
+compile-time `__ARM_FEATURE_*`, so aarch64 users never got it. Nothing was
+left on the table on x86; a great deal was on ARM.
 
 This matches the static analysis. The hot loops are branch- and latency-bound,
 not width-bound: `DecodeNumber` (`unpackinline.cpp:115`) is two table lookups
@@ -144,21 +165,23 @@ v3 codegen *does* change — a variable-shift bit-read compiles to BMI2 `shrx`
 at `-march=x86-64-v3`, confirmed via `audit-isa.sh` — it simply is not where
 the time goes.
 
-**Conclusion: ship a single baseline x86-64 binary.** The dispatcher works and
-is kept here for reuse, but on this evidence it is pure distribution cost.
+**Conclusion: keep shipping a single baseline `-march=x86-64` binary.** The
+dispatcher works and is retained here for reuse, but on this evidence it would
+be pure distribution cost. This question is closed; re-open it only with new
+evidence, not intuition.
 
-Worth trying before giving up on x86, all of which keep the source unmodified:
+If x86 decompression speed becomes a priority again, these are the remaining
+avenues, in descending order of expected value:
 
-- **PGO** — most promising for a branch-bound decompressor. Build with
-  `EXTRA_CPPFLAGS=-fprofile-generate EXTRA_LDFLAGS=-fprofile-generate`, run the
-  corpus, rebuild with `-fprofile-use`.
-- **`-O3`**, and **`-flto`** (needs the flag in `EXTRA_LDFLAGS` too, since the
-  vendored link rule at `makefile:52` uses only `$(LDFLAGS)`).
-- A **PCLMULQDQ CRC32**, the one large x86 win available — but that requires
-  source changes and so is outside this approach.
-
-Re-run at a larger corpus (`-s 256` or `-s 512`) to confirm; the `noise` and
-`verdict` columns in `bench.sh` make the significance call explicit.
+- A **PCLMULQDQ CRC32**. CRC covers 100% of output (`rdwrfn.cpp:189`) and is
+  currently scalar slicing-by-16 (`crc.cpp:111`); a folding implementation is
+  typically 3-10x. This is the one large x86 win available — but it needs
+  source changes, so it is outside this approach.
+- **PGO**, the most promising flag-only option for a branch-bound decompressor.
+  Build with `EXTRA_CPPFLAGS=-fprofile-generate EXTRA_LDFLAGS=-fprofile-generate`,
+  run the corpus, rebuild with `-fprofile-use`.
+- **`-O3`** and **`-flto`** (the latter needs the flag in `EXTRA_LDFLAGS` too,
+  since the vendored link rule at `makefile:52` uses only `$(LDFLAGS)`).
 
 ## The dispatcher (x86-64)
 
