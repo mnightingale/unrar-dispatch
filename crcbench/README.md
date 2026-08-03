@@ -15,13 +15,64 @@ crcbench/build/crcbench 25             # 25 timing runs instead of 15
 
 Standalone — does not link unrar, builds in a second.
 
-## Status
+## Status: measured, verified, and integrated
 
-| Implementation | Requires | Correctness | Throughput |
+Both folding paths pass the full correctness sweep on real x86-64 hardware,
+and the algorithm is now wired into `crc.cpp` (see *Integration* below).
+
+| Implementation | Requires | Correctness | Peak throughput |
 | --- | --- | --- | --- |
-| `slicing-by-16` | — (current unrar) | verified | baseline |
-| `fold-128` | SSE4.1 + PCLMULQDQ | **verified** | **not yet measured on real hardware** |
-| `fold-256` | AVX2 + VPCLMULQDQ | **NOT VERIFIED — see below** | not measured |
+| `slicing-by-16` | — (current unrar) | verified | ~4.1 GB/s |
+| `fold-128` | SSE4.1 + PCLMULQDQ | verified | ~37.7 GB/s |
+| `fold-256` | AVX2 + VPCLMULQDQ | verified | ~50.0 GB/s |
+
+Measured, min-of-15 (MB/s):
+
+| Buffer | slicing-by-16 | fold-128 | fold-256 | best vs baseline |
+| ---: | ---: | ---: | ---: | ---: |
+| 4 KB | 3347 | 26940 | 31002 | 9.26x |
+| 64 KB | 3205 | 37742 | 49960 | **15.59x** |
+| 1 MB | 4103 | 37488 | 49933 | 12.17x |
+| 4 MB | 4079 | 36243 | 47789 | 11.72x |
+| 64 MB | 4054 | 19128 | 21992 | 5.42x |
+
+Two things worth reading off this:
+
+**256-bit earns its place.** It beats the 128-bit path by ~32% across the
+cache-resident range and ~15% at the extremes. The prior expectation was that
+128-bit folding would already saturate the CLMUL port and 256-bit would add
+nothing; that was wrong, so both tiers are kept.
+
+**The 64 MB row is the honest floor.** Both folding paths drop sharply there
+(37.7 -> 19.1, 50.0 -> 22.0 GB/s) while slicing-by-16 stays flat at ~4 GB/s.
+That is the crossover from compute-bound to memory-bandwidth-bound: the table
+version was never near bandwidth, folding is. So 5.4x is what to expect on
+buffers that miss cache, not the 15.6x peak.
+
+**End-to-end is far less than either**, because unrar decompresses at a few
+hundred MB/s and CRC was only a slice of total runtime — but it is still
+large where it counts. Measured with `build-ab.sh` + `dispatch/bench.sh`,
+256 MB corpus, min-of-5, single-threaded:
+
+| Archive | table only | folding | Δ | noise |
+| --- | ---: | ---: | ---: | ---: |
+| `rar5-store-m0` | 82 ms | 25 ms | **+69.5%** | 3.7% |
+| `rar5-encrypted-m0` | 171 ms | 109 ms | **+36.3%** | 1.8% |
+| `rar5-text-m5` | 383 ms | 325 ms | +15.1% | 1.2% |
+| `rar5-encrypted` | 427 ms | 368 ms | +13.8% | 3.6% |
+| `rar5-vol.part01` | 849 ms | 774 ms | +8.8% | 1.0% |
+| `rar5-exe-m5` | 823 ms | 777 ms | +5.6% | 1.0% |
+| `rar5-solid-m5` | 50 ms | 48 ms | +4.0% | 5.3% (noise) |
+| `rar5-many-m5` | 181 ms | 179 ms | +1.1% | 2.2% (noise) |
+
+No row is slower in either thread mode. As predicted, the gain concentrates on
+stored and encrypted-stored archives, where there is no LZ work to dominate:
+**stored data decodes 3.3x faster**.
+
+At default thread count the gains shrink (`store-m0` +23.5%, most others
+2-5%) because `DataHash::Update` already threads CRC above 32 KB
+([hash.cpp:134](../hash.cpp)) — much of the win was previously being bought
+with extra cores, and folding now buys it outright on one.
 
 ### What was verified, and where
 
@@ -36,32 +87,49 @@ Standalone — does not link unrar, builds in a second.
 - incremental splits across a 64 KB buffer — unrar calls CRC32 per output
   block, so chained calls must equal a single call
 
-### The fold-256 caveat
+Note the harness always runs the full correctness sweep *before* reporting any
+timing and aborts on failure, so a fast-but-wrong implementation can never be
+mistaken for a result.
 
-**`fold-256` has never been executed.** It is written and compiles cleanly,
-but no available environment can run it:
+`fold-256` could not be executed during development (arm64 host; Rosetta 2 has
+no AVX2; QEMU TCG up to 10.0.11 with `-cpu max` does not implement
+`CPUID.07H:ECX.vpclmulqdq [bit 10]`). It was verified on the first run against
+real hardware with VPCLMULQDQ.
 
-- the development machine is arm64
-- Rosetta 2 provides SSE4.2 but not AVX2
-- QEMU TCG — tested up to QEMU 10.0.11 with `-cpu max` — does not implement
-  `CPUID.07H:ECX.vpclmulqdq [bit 10]`
+## Integration
 
-Its structure mirrors the 128-bit path exactly (the same four 128-bit lanes,
-just packed two per register, with the same per-lane constants and the same
-lane→register extraction order as the rapidyenc reference), so the risk is
-low. But low risk is not verification.
+`crcfold.cpp` is included by `crc.cpp` and used inside `CRC32()`. The change
+to `crc.cpp` is 30 lines, all additive, so upstream drops stay diffable:
 
-**This is safe in practice because the harness always runs the full
-correctness sweep before reporting any timing, and aborts on failure.** Run it
-on a CPU with VPCLMULQDQ and it either verifies or fails loudly. Until then,
-treat `fold-256` as unproven and do not integrate it.
+- `crcfold.cpp` is `#include`d, not a separate translation unit, matching how
+  `blake2s_sse.cpp` is included by `blake2s.cpp`. No makefile or `.vcxproj`
+  change is needed, and `rar.hpp` is untouched.
+- The fold functions process **whole 64-byte blocks only** and carry no scalar
+  tail: `CRC32()` already has slicing-by-16 and byte loops for the remainder,
+  so no second table is shipped.
+- Width is detected once from `InitCRC32` (alongside the existing `CRC_Neon`
+  detection) and cached in `CRCFoldWidth`; it defaults to 0, so if detection
+  has not run the code falls through to the table path.
+- Excluded from `SFX_MODULE`, matching the existing `USE_SLICING` treatment —
+  the SFX module avoids carrying extra license text and benefits little.
 
-### Throughput numbers are not yet meaningful
+### A/B measurement
 
-An emulated run showed ~11x for `fold-128`, but that figure is an artifact:
-QEMU translates table lookups and PCLMULQDQ with wildly different overheads.
-Published results for this algorithm are typically **3–10x** over
-slicing-by-N. Real numbers require real hardware.
+Build with `-DNO_CRC_FOLD` for the original table-only behaviour.
+`build-ab.sh` builds both and confirms they actually differ:
+
+```bash
+crcbench/build-ab.sh
+dispatch/bench.sh -b crcbench/build-ab -c dispatch/corpus
+```
+
+Variants are named `a-nofold` / `b-fold` so `ls` order puts the baseline
+first, making bench.sh's `delta` column read as folding-vs-baseline (positive
+means folding is faster). Output goes to `crcbench/build-ab/` so it does not
+disturb ISA variants in `dispatch/build`.
+
+Verified on x86-64 that `-DNO_CRC_FOLD` yields 0 `pclmulqdq` instructions and
+removes every `CRCFold` symbol, while the default build has 24.
 
 ## Design notes
 
@@ -114,15 +182,31 @@ Note [license.txt](../license.txt) requires modified distributions to state
 that they are modified, in both documentation and source comments — relevant
 once this is integrated into `crc.cpp`.
 
-## Next step
+## Verification status
 
-Run on x86-64 hardware. The output reports whether the CPU supports each path,
-so it is self-describing:
+Complete. On VPCLMULQDQ hardware (so the `fold-256` path is the one actually
+exercised inside unrar), `dispatch/verify-parity.sh` reports:
 
-1. If `fold-128` shows a large win — integrate it into `crc.cpp` behind a
-   runtime check, replacing the bulk loop and keeping slicing-by-16 as the
-   fallback for non-PCLMUL CPUs and the SFX build.
-2. If `fold-256` is available and beats `fold-128` by more than noise, add it
-   as a second tier. If it does not, drop it — it costs code for nothing.
-3. If neither beats the table meaningfully, this closes the same way the
-   `-march` investigation did.
+- both builds pass `unrar t` on every corpus archive
+- extractions are byte-identical between them (2003 files)
+- extracted content matches the original source data
+- error exit codes agree: `corrupt=3`, `badpassword=11`, `missing=10`
+
+Together with the `crcbench` sweep (known answers, lengths 0-600 x 4 offsets,
+incremental splits) this covers both the algorithm and its integration.
+
+## Remaining gap: MSVC
+
+`CRCFoldDetect()` uses `__builtin_cpu_supports` / `__cpuid_count`, which are
+GCC/Clang only. On MSVC it sets `CRCFoldWidth=0`, so Windows builds silently
+fall back to the table path.
+
+This is *safe* — correct, just no faster — but the feature is inactive there.
+Enabling it means writing the detection with MSVC's `__cpuid`/`__cpuidex`
+(the same shape as the existing detection at [system.cpp:206](../system.cpp)).
+That is deliberately not done here: it cannot be compiled or tested in this
+environment, and shipping untested CPUID code risks breaking the Windows build
+for a platform that currently works correctly.
+
+No `.vcxproj` change is needed either way, since `crcfold.cpp` is `#include`d
+rather than compiled separately.

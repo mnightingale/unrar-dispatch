@@ -18,9 +18,11 @@ BUILD=$(DIR)build
 
 all: $(BUILD)/crcbench
 
-$(BUILD)/crcbench: $(DIR)crcbench.cpp $(DIR)crc_fold.cpp $(DIR)crc_fold.h
+# crcfold.cpp is #included by crcbench.cpp (as crc.cpp does), not compiled
+# separately - so the benchmark measures the shipping implementation.
+$(BUILD)/crcbench: $(DIR)crcbench.cpp $(DIR)../crcfold.cpp
 	@mkdir -p $(BUILD)
-	$(CXX) $(CXXFLAGS) -o $@ $(DIR)crcbench.cpp $(DIR)crc_fold.cpp
+	$(CXX) $(CXXFLAGS) -o $@ $(DIR)crcbench.cpp
 
 run: $(BUILD)/crcbench
 	@$(BUILD)/crcbench

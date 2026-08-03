@@ -17,8 +17,6 @@
 #include <vector>
 #include <algorithm>
 
-#include "crc_fold.h"
-
 /* ------------------------------------------------------------------ */
 /* Reference: unrar's slicing-by-16, copied verbatim from crc.cpp so    */
 /* the comparison is against exactly what ships today.                  */
@@ -29,6 +27,17 @@
 
 typedef unsigned int uint;
 typedef unsigned char byte;
+
+/*
+ * The folding implementation is included from the production file rather than
+ * copied, so the benchmark cannot drift from what actually ships in crc.cpp.
+ * crcfold.cpp provides whole-64-byte-block functions with no scalar tail;
+ * the wrappers below add the same tail crc.cpp uses.
+ */
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
+#define CRC_FOLD_X86
+#include "../crcfold.cpp"
+#endif
 
 static uint crc_tables[16][256];
 
@@ -90,6 +99,39 @@ static uint CRC32Slice16(uint StartCRC,const void *Addr,size_t Size)
 }
 
 /* ------------------------------------------------------------------ */
+/* Wrappers pairing the block-only fold functions with the same scalar   */
+/* tail crc.cpp applies, so timings reflect a complete CRC32() call.     */
+/* ------------------------------------------------------------------ */
+
+#ifdef CRC_FOLD_X86
+static uint Bench128(uint CRC,const void *Addr,size_t Size)
+{
+  const byte *Data=(const byte *)Addr;
+  size_t Blocks=Size/64;
+  if (Blocks>0)
+  {
+    CRC=CRCFold128(CRC,Data,Blocks);
+    Data+=Blocks*64;
+    Size-=Blocks*64;
+  }
+  return CRC32Slice16(CRC,Data,Size);
+}
+
+static uint Bench256(uint CRC,const void *Addr,size_t Size)
+{
+  const byte *Data=(const byte *)Addr;
+  size_t Blocks=Size/64;
+  if (Blocks>0)
+  {
+    CRC=CRCFold256(CRC,Data,Blocks);
+    Data+=Blocks*64;
+    Size-=Blocks*64;
+  }
+  return CRC32Slice16(CRC,Data,Size);
+}
+#endif
+
+/* ------------------------------------------------------------------ */
 
 typedef uint (*CRCFunc)(uint,const void *,size_t);
 
@@ -106,8 +148,9 @@ static std::vector<Impl> BuildImpls()
   std::vector<Impl> V;
   V.push_back({"slicing-by-16", CRC32Slice16, true, "baseline (current unrar)"});
 #ifdef CRC_FOLD_X86
-  V.push_back({"fold-128",      CRC32Fold128, CRC32FoldHave128()!=0, "SSE4.1 + PCLMULQDQ"});
-  V.push_back({"fold-256",      CRC32Fold256, CRC32FoldHave256()!=0, "AVX2 + VPCLMULQDQ"});
+  CRCFoldDetect();
+  V.push_back({"fold-128", Bench128, CRCFoldWidth>=128, "SSE4.1 + PCLMULQDQ"});
+  V.push_back({"fold-256", Bench256, CRCFoldWidth>=256, "AVX2 + VPCLMULQDQ"});
 #endif
   return V;
 }
