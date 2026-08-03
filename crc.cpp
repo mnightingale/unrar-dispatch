@@ -12,18 +12,32 @@
 //    available at http://www.opensource.org/licenses/bsd-license.html
 
 
+// This file contains a local modification: an x86 PCLMULQDQ/VPCLMULQDQ
+// folding path added to CRC32(). See crcfold.cpp and license.txt.
+
 #include "rar.hpp"
 
 #ifndef SFX_MODULE
 // User suggested to avoid BSD license in SFX module, so they do not need
 // to include the license to SFX archive.
 #define USE_SLICING
+
+// Same reasoning for the zlib-licensed folding code, and the SFX module
+// benefits little from it.
+#if defined(__i386__) || defined(__x86_64__) || defined(_M_IX86) || \
+    defined(_M_X64)
+#define USE_CRC_FOLD
+#endif
 #endif
 
 static uint crc_tables[16][256]; // Tables for Slicing-by-16.
 
 #ifdef USE_NEON_CRC32
 static bool CRC_Neon;
+#endif
+
+#ifdef USE_CRC_FOLD
+#include "crcfold.cpp"
 #endif
 
 
@@ -53,6 +67,9 @@ void InitCRC32(uint *CRCTab)
   #endif
 #endif
 
+#ifdef USE_CRC_FOLD
+  CRCFoldDetect();
+#endif
 }
 
 
@@ -96,6 +113,19 @@ uint CRC32(uint StartCRC,const void *Addr,size_t Size)
       StartCRC = __builtin_aarch64_crc32b(StartCRC, *Data);
 #endif
     return StartCRC;
+  }
+#endif
+
+#ifdef USE_CRC_FOLD
+  // Carry-less multiply folding, an order of magnitude faster than the table
+  // below on large buffers. Whole 64-byte blocks only; the slicing-by-16 and
+  // byte loops below handle the remainder, so no scalar tail is duplicated.
+  if (CRCFoldWidth!=0 && Size>=64)
+  {
+    size_t Blocks=Size/64;
+    StartCRC=CRCFoldBlocks(StartCRC,Data,Blocks);
+    Data+=Blocks*64;
+    Size-=Blocks*64;
   }
 #endif
 
