@@ -161,6 +161,47 @@ static std::vector<Impl> BuildImpls()
 
 static int Failures=0;
 
+/*
+ * Cross-check the hand-rolled CPUID bit tests in crcfold.cpp against the
+ * compiler's own feature detection.
+ *
+ * This matters for MSVC: that build uses the same shared detection logic with
+ * only the CPUID/XGETBV intrinsic spelled differently, and MSVC has no
+ * __builtin_cpu_supports to fall back on. Validating the bit numbers here
+ * means the only thing untested on Windows is the intrinsic name.
+ */
+#if defined(CRC_FOLD_X86) && (defined(__GNUC__) || defined(__clang__))
+static void CheckDetection()
+{
+  __builtin_cpu_init();
+
+  bool WantPclmul=__builtin_cpu_supports("pclmul")!=0;
+  bool WantSSE41 =__builtin_cpu_supports("sse4.1")!=0;
+  bool WantAVX2  =__builtin_cpu_supports("avx2")!=0;
+
+  bool Got128=(CRCFoldWidth>=128);
+  bool Want128=WantSSE41 && WantPclmul;
+  if (Got128!=Want128)
+  {
+    printf("  FAIL  cpuid 128-bit detect: got %d, __builtin_cpu_supports says %d\n",
+           (int)Got128,(int)Want128);
+    Failures++;
+  }
+
+  /* 256-bit needs AVX2 too; if the compiler says no AVX2 we must not have
+     selected it. The converse is not implied - VPCLMULQDQ is separate. */
+  if (CRCFoldWidth>=256 && !WantAVX2)
+  {
+    printf("  FAIL  cpuid 256-bit detect: selected AVX2 path but CPU lacks AVX2\n");
+    Failures++;
+  }
+
+  if (Failures==0)
+    printf("  PASS  cpuid detection agrees with __builtin_cpu_supports (width=%u)\n",
+           CRCFoldWidth);
+}
+#endif
+
 static void Fail(const char *Impl,const char *What,uint Got,uint Want)
 {
   printf("  FAIL  %-14s %s: got %08x want %08x\n",Impl,What,Got,Want);
@@ -253,19 +294,31 @@ static double ThroughputMBs(const Impl &I,const byte *Buf,size_t Size,int Runs)
   volatile uint Sink=0;
   double Best=1e30;
 
+  /*
+   * Repeat small buffers inside the timed region. A single 4KB pass at
+   * ~39 GB/s takes ~100ns, which is exactly one tick of the Windows
+   * steady_clock - the measurement quantises and every implementation
+   * reports the same fabricated number. Aim for at least 64MB of work per
+   * timed region so elapsed time is far above clock resolution.
+   */
+  const size_t TargetBytes=64u<<20;
+  size_t Reps=TargetBytes/Size;
+  if (Reps<1) Reps=1;
+
   // Warm up: first pass pulls the buffer into cache.
   Sink^=I.Func(0xffffffff,Buf,Size);
 
   for (int R=0;R<Runs;R++)
   {
     auto T0=std::chrono::steady_clock::now();
-    Sink^=I.Func(0xffffffff,Buf,Size);
+    for (size_t K=0;K<Reps;K++)
+      Sink^=I.Func(0xffffffff,Buf,Size);
     auto T1=std::chrono::steady_clock::now();
     double Sec=std::chrono::duration<double>(T1-T0).count();
     if (Sec<Best) Best=Sec;
   }
   (void)Sink;
-  return (double)Size/Best/(1024.0*1024.0);
+  return (double)Size*(double)Reps/Best/(1024.0*1024.0);
 }
 
 int main(int argc,char *argv[])
@@ -302,6 +355,9 @@ int main(int argc,char *argv[])
   }
 
   printf("=== correctness ===\n");
+#if defined(CRC_FOLD_X86) && (defined(__GNUC__) || defined(__clang__))
+  CheckDetection();
+#endif
   for (size_t K=0;K<Impls.size();K++)
   {
     if (!Impls[K].Available)

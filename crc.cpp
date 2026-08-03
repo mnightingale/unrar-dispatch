@@ -124,8 +124,7 @@ uint CRC32(uint StartCRC,const void *Addr,size_t Size)
   if (CRCFoldWidth!=0 && Size>=64)
   {
     size_t Blocks=Size/64;
-    StartCRC=CRCFoldWidth>=256 ? CRCFold256(StartCRC,Data,Blocks)
-                               : CRCFold128(StartCRC,Data,Blocks);
+    StartCRC=CRCFoldBlocks(StartCRC,Data,Blocks);
     Data+=Blocks*64;
     Size-=Blocks*64;
   }

@@ -26,7 +26,8 @@ and the algorithm is now wired into `crc.cpp` (see *Integration* below).
 | `fold-128` | SSE4.1 + PCLMULQDQ | verified | ~37.7 GB/s |
 | `fold-256` | AVX2 + VPCLMULQDQ | verified | ~50.0 GB/s |
 
-Measured, min-of-15 (MB/s):
+Measured on Linux/GCC, min-of-15 (MB/s). Windows/MSVC on the same class of
+hardware agrees within a few percent:
 
 | Buffer | slicing-by-16 | fold-128 | fold-256 | best vs baseline |
 | ---: | ---: | ---: | ---: | ---: |
@@ -195,18 +196,280 @@ exercised inside unrar), `dispatch/verify-parity.sh` reports:
 Together with the `crcbench` sweep (known answers, lengths 0-600 x 4 offsets,
 incremental splits) this covers both the algorithm and its integration.
 
-## Remaining gap: MSVC
+## MSVC / Windows
 
-`CRCFoldDetect()` uses `__builtin_cpu_supports` / `__cpuid_count`, which are
-GCC/Clang only. On MSVC it sets `CRCFoldWidth=0`, so Windows builds silently
-fall back to the table path.
+Implemented. MSVC and GCC/Clang share one `CRCFoldDetect()`; only the CPUID
+and XGETBV *intrinsics* differ, wrapped in `CRCFoldCpuid()` / `CRCFoldXcr0()`:
 
-This is *safe* — correct, just no faster — but the feature is inactive there.
-Enabling it means writing the detection with MSVC's `__cpuid`/`__cpuidex`
-(the same shape as the existing detection at [system.cpp:206](../system.cpp)).
-That is deliberately not done here: it cannot be compiled or tested in this
-environment, and shipping untested CPUID code risks breaking the Windows build
-for a platform that currently works correctly.
+| | GCC/Clang | MSVC |
+| --- | --- | --- |
+| CPUID | `__cpuid_count` | `__cpuidex` |
+| XCR0 | inline `xgetbv` | `_xgetbv` |
+| Per-function ISA | `__attribute__((target(...)))` | not needed |
 
-No `.vcxproj` change is needed either way, since `crcfold.cpp` is `#include`d
-rather than compiled separately.
+Sharing the logic means the Linux build exercises the exact bit tests Windows
+will run, so `crcbench` cross-checks them against `__builtin_cpu_supports` and
+reports `PASS cpuid detection agrees with __builtin_cpu_supports`. Only the
+intrinsic spelling is Windows-specific.
+
+The bits tested:
+
+| Feature | CPUID leaf | Bit |
+| --- | --- | --- |
+| PCLMULQDQ | 1:ECX | 1 |
+| SSE4.1 | 1:ECX | 19 |
+| OSXSAVE | 1:ECX | 27 |
+| AVX | 1:ECX | 28 |
+| AVX2 | 7.0:EBX | 5 |
+| VPCLMULQDQ | 7.0:ECX | 10 |
+
+The AVX path additionally checks `XCR0` bits 1 and 2, confirming the OS saves
+XMM and YMM state. GCC's `__builtin_cpu_supports("avx2")` does this
+internally; MSVC has no equivalent, so it is done explicitly for both.
+
+`_mm256_clmulepi64_epi128` arrived in Visual Studio 2019, so `CRCFOLD_HAVE_256`
+is gated on `_MSC_VER >= 1920`; older MSVC compiles the 256-bit path out
+entirely and still gets `fold-128`. MSVC needs no `/arch` flag for these
+intrinsics.
+
+No `.vcxproj` change is needed, since `crcfold.cpp` is `#include`d rather than
+compiled separately.
+
+**Confirmed working on Windows/MSVC**, including the 256-bit path. MSVC
+accepted `_mm256_clmulepi64_epi128` with no `/arch:AVX2` flag, so runtime
+dispatch works there exactly as on GCC/Clang, and all three implementations
+pass the correctness sweep. Measured throughput tracks the Linux result
+closely (54054 vs 49933 MB/s at 1 MB), so the two toolchains agree.
+
+`unrar.exe` has now been built and A/B'd end-to-end on Windows too — see
+*Windows end-to-end results* below. Folding works there, but the percentages
+are smaller than on Linux for reasons that are mostly not about the CRC code.
+
+### Building on Windows from the command line
+
+All commands need a **Developer Command Prompt for VS** (or run `vcvars64.bat`
+first), so `cl.exe` and `msbuild.exe` are on `PATH`:
+
+```
+"C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
+```
+
+**The benchmark** is one self-contained file:
+
+```
+cl /O2 /EHsc /Fe:crcbench.exe crcbench\crcbench.cpp
+crcbench.exe
+```
+
+**unrar itself** builds from the existing project, but the shipped project is
+old enough to need two overrides:
+
+```
+msbuild UnRAR.vcxproj /p:Configuration=Release /p:Platform=x64 ^
+        /p:PlatformToolset=v143 /p:WindowsTargetPlatformVersion=10.0
+```
+
+Output lands in `build\unrar64\Release\unrar.exe`.
+
+Both overrides are required:
+
+- **`PlatformToolset=v143`** — the project ships `v140_xp` (VS2015,
+  `_MSC_VER` 1900), which is usually not installed alongside a modern Visual
+  Studio, *and* is below the `_MSC_VER >= 1920` gate for
+  `_mm256_clmulepi64_epi128`. With the stock toolset you silently get
+  `fold-128` only. `v143` is VS2022; use `v142` for VS2019.
+- **`WindowsTargetPlatformVersion=10.0`** — the project pins Windows SDK 8.1,
+  which modern Visual Studio installs do not ship, failing with
+  `error MSB8036`. Bare `10.0` resolves to the newest installed Windows 10/11
+  SDK.
+
+Passing these on the command line rather than editing the `.vcxproj` keeps the
+vendored project files byte-identical to upstream, which is the same principle
+the rest of this work follows.
+
+`crcfold.cpp` is deliberately absent from the `.vcxproj` file list, because
+`crc.cpp` `#include`s it. Do not add it, or it will be compiled twice and
+fail to link on duplicate symbols.
+
+Note `crcfold.cpp` includes `<intrin.h>` itself for `__cpuid`/`__cpuidex`.
+[os.hpp](../os.hpp) already does that for MSVC unrar builds, but `crcbench`
+compiles the file standalone without `rar.hpp`, so it cannot rely on it.
+
+MSVC turned out **not** to need `/arch:AVX2` for `_mm256_clmulepi64_epi128`
+(verified on VS2022), so no per-file project settings are required and the
+`.vcxproj` files stay untouched. Had it demanded that flag, the fix would have
+been a separate `.cpp` with a per-file `/arch:AVX2` setting — never the flag
+globally, which would let the compiler emit AVX2 anywhere and break the binary
+on pre-AVX2 CPUs.
+
+#### VEX containment — verified, and worth re-verifying
+
+Not needing `/arch:AVX2` is convenient but it is not automatically safe, and
+this is the one part of the MSVC build that deserves an actual disassembly
+check rather than trust. MSVC has no `__attribute__((target))`, so
+`CRCFOLD_TARGET_128/256` expand to nothing and the compiler is free to inline
+`CRCFold256` and `CRCFold128` into `CRC32` and schedule them together. Two
+things could then go wrong:
+
+- AVX2 setup (constant materialisation, register zeroing) hoisted *above* the
+  `CRCFoldWidth>=256` test, so a ymm instruction executes on a CPU without
+  AVX2.
+- The 128-bit path VEX-encoded because it shares a function with AVX code —
+  `vpxor xmm` instead of `pxor`. Those are AVX instructions, so this would
+  fault on exactly the Westmere-era SSE4.1+PCLMULQDQ parts the 128-bit path
+  exists to serve.
+
+Checked on the VS2022 v143 x64 Release build (`dumpbin /disasm`), both are
+clean:
+
+- `CRC32` loads `CRCFoldWidth`, tests it against 0, tests `Size>=64`, then
+  branches on `cmp eax,100h`. Every VEX-encoded instruction in the function —
+  including the 128-bit `vpxor xmm5,xmm5,xmm5` and `vmovdqu xmm4,xmm4` that
+  set up the fold state — lies *after* that branch. Nothing VEX-encoded is
+  reachable when `CRCFoldWidth` is 128.
+- `CRCFold128` was kept out of line and is entirely legacy-SSE encoded: 0 VEX
+  instructions in the function or in the reduction it inlines (`pclmulqdq`
+  `66 0F 3A 44`, `movdqa` `66 0F 6F`, `xorps` `0F 57`).
+- The only other ymm instructions in the binary are inside the CRT's own
+  runtime-dispatched `memcpy`/string routines.
+
+This is a property of one compiler version's inliner, not something the source
+guarantees, so re-check it after a toolset upgrade:
+
+```
+dumpbin /disasm build\unrar64\Release\unrar-fold.exe > fold.asm
+```
+
+then confirm every `ymm` reference and every `C5`/`C4` VEX prefix in `CRC32`
+sits below the `cmp eax,100h` branch. If a future MSVC ever hoists one above
+it, the fix is to move `CRCFold256` into its own translation unit compiled
+with `/arch:AVX2`, keeping `crc.cpp` itself at the default ISA.
+
+**A/B measurement on Windows.** MSVC's `cl.exe` honours the `CL` environment
+variable, so the baseline needs no project edit:
+
+```
+set CL=/DNO_CRC_FOLD
+msbuild UnRAR.vcxproj /p:Configuration=Release /p:Platform=x64 ^
+        /p:PlatformToolset=v143 /p:WindowsTargetPlatformVersion=10.0 /t:Rebuild
+set CL=
+```
+
+Use `/t:Rebuild` when toggling the define — MSBuild will not otherwise notice
+that compiler flags changed, only that sources did not, and would silently
+reuse the previous objects.
+
+Rename the resulting `unrar.exe` between the two builds, since both
+configurations write to the same output path.
+
+Then benchmark with [dispatch/bench.ps1](../dispatch/bench.ps1), the Windows
+equivalent of `dispatch/bench.sh` (same min-of-N, warmup, and noise/verdict
+columns; written for Windows PowerShell 5.1):
+
+```
+.\dispatch\bench.ps1 -Exe unrar-nofold.exe,unrar-fold.exe -Corpus dispatch\corpus
+```
+
+List the baseline first — `delta` compares the last exe against the first. If
+execution policy blocks it, use
+`powershell -ExecutionPolicy Bypass -File dispatch\bench.ps1 ...`.
+
+The corpus itself needs `rar` and a POSIX shell to generate
+(`dispatch/make-corpus.sh`), so copy `dispatch\corpus` across from the Linux
+machine rather than rebuilding it on Windows.
+
+Better still, use `crcbench\build-ab.ps1`, which does both builds and then
+*verifies* them. Two hand-driven builds that both write to
+`build\unrar64\Release\unrar.exe` have to be told apart by renaming, and a
+rename done backwards yields two working binaries whose A/B result is simply
+inverted — with nothing in the output to say so. That happened here once
+already. The script fails if the baseline contains `pclmulqdq` or the folding
+build does not.
+
+### Windows end-to-end results
+
+Measured on a Ryzen 7 5800X (Zen 3, 8C/16T, 32 GB), Windows 11, VS2022 v143,
+min-of-11, `-mt1`, comparing `UNRAR_CRC_FOLD` modes of one binary:
+
+| Archive | fold=0 | fold=256 | saved | Δ raw | Δ less launch floor |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `rar5-encrypted-m0` | 261 ms | 218 ms | 43 ms | +16.6% | **+19.6%** |
+| `rar5-text-m5` | 449 ms | 409 ms | 40 ms | +8.9% | +9.7% |
+| `rar5-exe-m5` | 876 ms | 830 ms | 46 ms | +5.3% | +5.5% |
+| `rar5-store-m0` | 174 ms | 167 ms | 8 ms | +4.4% | +5.7% |
+
+Folding is a real win on Windows, and the *absolute* saving is a consistent
+~40-46 ms per 256 MB — the same order as Linux. What differs is the
+percentage, for three reasons, none of them a defect in the folding code:
+
+**1. A ~40 ms process-launch floor.** Measured with `bench.ps1`, which now
+reports it. Windows process creation plus on-access anti-virus scanning of the
+freshly written `unrar.exe` costs tens of milliseconds against roughly one for
+`fork`+`exec`. That floor sits inside every row and shrinks every percentage
+without changing the milliseconds saved. Subtract it from both columns before
+comparing a Windows percentage against a Linux one.
+
+**2. `rar5-store-m0` is I/O-bound here, not CRC-bound.** It was Linux's
+headline result (+69.5%) and is Windows' weakest row, which looks alarming
+until the CPU time is separated from the wall clock:
+
+| Archive | fold | CPU/run | wall/run |
+| --- | ---: | ---: | ---: |
+| `store-m0` | 0 | 109.4 ms | 155.3 ms |
+| `store-m0` | 256 | 82.8 ms | 149.0 ms |
+| `encrypted-m0` | 0 | 248.4 ms | 258.6 ms |
+| `encrypted-m0` | 256 | 201.6 ms | 213.3 ms |
+
+For `encrypted-m0` the 46.8 ms of CPU saved becomes 45.3 ms of wall time — it
+converts one-for-one. For `store-m0` a 26.6 ms CPU saving buys only 6.3 ms of
+wall time, because ~46 ms of its wall clock is I/O wait that folding cannot
+touch: the process simply waits on the file instead. A stored archive is read
+and CRC'd and nothing else, so it has no other CPU work to hide the wait
+behind. On Linux the page cache served the same file with almost no wait —
+its entire `store-m0` run (82 ms) was shorter than this machine's CPU time
+alone.
+
+Note also that `store-m0` saves less *CPU* (26.6 ms) than the microbenchmark
+predicts (~57 ms). In the stored path the CRC reads a 4 MB buffer
+(`File::CopyBufferSize()`, [file.hpp:148](../file.hpp)) that `ReadFile` has
+just filled, so it streams from L3/DRAM and is bandwidth-bound. In the
+encrypted path AES has already pulled that buffer into cache, so the CRC runs
+cache-hot and folding delivers its full rate. This is the "64 MB row is the
+honest floor" caveat from the throughput table, showing up end-to-end.
+
+**3. This CPU folds at about half the Linux box's rate.** `crcbench` on the
+same hardware as the table above:
+
+| | slicing-by-16 | fold-128 | fold-256 |
+| --- | ---: | ---: | ---: |
+| Linux box (1 MB) | 4103 | 37488 | 49933 |
+| This 5800X (1 MB) | 3913 | 18322 | 32502 |
+
+The table path matches within 5%, so the machines are comparable in general;
+`(V)PCLMULQDQ` throughput is what differs. Zen 3 splits 256-bit CLMUL into two
+128-bit operations, so `fold-256` is only 1.77x `fold-128` here against 1.33x
+there, and both widths are roughly half the absolute rate. That is a hardware
+difference, not a Windows or MSVC one — do not read the earlier claim that
+"Windows/MSVC agrees within a few percent" as covering this part, since that
+comparison was made on different silicon.
+
+### Two Windows benchmarking traps
+
+Both of these produced a confident, wrong "folding does nothing on Windows".
+
+**`-FoldModes` silently collapsed to one variant.** `powershell -File
+bench.ps1 -FoldModes 0,128,256` passes the list as the single *string*
+`"0,128,256"`, and PowerShell reads those commas as thousands separators, so
+the old `[int[]]` parameter converted it to the single value `128256`. The run
+then had one variant, compared it against itself, and printed `0.0%` delta and
+`noise` on every row — which reads exactly like a null result. `bench.ps1` now
+takes the argument as a string, splits it itself, rejects anything that is not
+`0`, `128` or `256`, and warns loudly when only one variant is being timed.
+
+**Defender inflates the noise floor.** Windows rows here show 6-9% run-to-run
+spread against 1-4% on Linux, which is enough to push a genuine +5.8% result
+into the `noise` verdict. If you have administrator rights, adding
+`dispatch\corpus` and the build output directory to Defender's exclusion list
+for the duration of the benchmarking makes the numbers considerably more
+stable. That is a change to a security setting, so it is a deliberate decision
+to make and to undo afterwards, not something the scripts do for you.

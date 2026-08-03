@@ -25,15 +25,29 @@
 // the intrinsics header explicitly so this file also compiles standalone
 // (crcbench/ builds it directly to benchmark exactly what ships).
 #include <immintrin.h>
+#include <stdlib.h>     // getenv/atoi for the UNRAR_CRC_FOLD override
 
 #if defined(__GNUC__) || defined(__clang__)
   #include <cpuid.h>
   #define CRCFOLD_TARGET_128 __attribute__((target("sse4.1,pclmul")))
   #define CRCFOLD_TARGET_256 __attribute__((target("avx2,vpclmulqdq,pclmul,sse4.1")))
+  #define CRCFOLD_HAVE_256
 #else
-  // MSVC permits these intrinsics without per-function target attributes.
+  // __cpuid/__cpuidex live in <intrin.h>, not <immintrin.h>. os.hpp already
+  // includes it for MSVC builds of unrar, but crcbench compiles this file
+  // standalone without rar.hpp, so include it here too - the include guards
+  // make that free in the unrar build.
+  #include <intrin.h>
+
+  // MSVC permits these intrinsics without per-function target attributes and
+  // without a matching /arch flag. _mm256_clmulepi64_epi128 (VPCLMULQDQ)
+  // arrived in Visual Studio 2019, so the 256-bit path is compiled out below
+  // that; the 128-bit path works on all supported versions.
   #define CRCFOLD_TARGET_128
   #define CRCFOLD_TARGET_256
+  #if _MSC_VER >= 1920
+    #define CRCFOLD_HAVE_256
+  #endif
 #endif
 
 // k1 = 0x154442bd4, k2 = 0x1c6e41596. Folds a 512-bit distance, used by both
@@ -153,6 +167,8 @@ static uint CRCFold128(uint StartCRC,const byte *Data,size_t Blocks)
 }
 
 
+#ifdef CRCFOLD_HAVE_256
+
 CRCFOLD_TARGET_256
 static __m256i CRCFold256Step(__m256i Src,__m256i Data)
 {
@@ -191,34 +207,110 @@ static uint CRCFold256(uint StartCRC,const byte *Data,size_t Blocks)
   return CRCFoldReduce(X0,X1,X2,X3);
 }
 
+#endif // CRCFOLD_HAVE_256
+
 
 // Detected once from InitCRC32. 0 = none, 128 = SSE4.1+PCLMULQDQ,
 // 256 = AVX2+VPCLMULQDQ.
 static uint CRCFoldWidth;
 
+
+// CPUID and XGETBV, spelled per compiler. Only these two wrappers differ
+// between MSVC and GCC/Clang; the detection logic below is shared, so the
+// GCC build exercises exactly the same bit tests the MSVC build will use.
+static void CRCFoldCpuid(uint Leaf,uint SubLeaf,uint Regs[4])
+{
+#if defined(_MSC_VER)
+  __cpuidex((int *)Regs,(int)Leaf,(int)SubLeaf);
+#else
+  uint A,B,C,D;
+  __cpuid_count(Leaf,SubLeaf,A,B,C,D);
+  Regs[0]=A; Regs[1]=B; Regs[2]=C; Regs[3]=D;
+#endif
+}
+
+
+// Low 32 bits of XCR0. Only valid if OSXSAVE is set - executing XGETBV
+// without it raises #UD, so callers must check first.
+static uint CRCFoldXcr0()
+{
+#if defined(_MSC_VER)
+  return (uint)_xgetbv(0);
+#else
+  uint Lo,Hi;
+  __asm__ __volatile__("xgetbv" : "=a"(Lo),"=d"(Hi) : "c"(0));
+  (void)Hi;
+  return Lo;
+#endif
+}
+
+
 static void CRCFoldDetect()
 {
-#if defined(__GNUC__) || defined(__clang__)
-  __builtin_cpu_init();
+  uint Regs[4];
 
-  if (!__builtin_cpu_supports("sse4.1") || !__builtin_cpu_supports("pclmul"))
-  {
-    CRCFoldWidth=0;
+  CRCFoldWidth=0;
+
+  CRCFoldCpuid(0,0,Regs);
+  uint MaxLeaf=Regs[0];
+  if (MaxLeaf<1)
     return;
-  }
+
+  CRCFoldCpuid(1,0,Regs);
+  bool HasPclmul =(Regs[2] & (1u<< 1))!=0; // CPUID.1:ECX[1]
+  bool HasSSE41  =(Regs[2] & (1u<<19))!=0; // CPUID.1:ECX[19]
+  bool HasOSXsave=(Regs[2] & (1u<<27))!=0; // CPUID.1:ECX[27]
+  bool HasAVX    =(Regs[2] & (1u<<28))!=0; // CPUID.1:ECX[28]
+
+  if (!HasSSE41 || !HasPclmul)
+    return;
   CRCFoldWidth=128;
 
-  // AVX2 first: it also covers the OSXSAVE/xgetbv check for YMM state.
-  // VPCLMULQDQ is CPUID.(EAX=7,ECX=0):ECX bit 10, queried directly because
-  // __builtin_cpu_supports("vpclmulqdq") needs GCC 11+.
-  if (__builtin_cpu_supports("avx2") && __get_cpuid_max(0,NULL)>=7)
-  {
-    uint EAX,EBX,ECX,EDX;
-    __cpuid_count(7,0,EAX,EBX,ECX,EDX);
-    if ((ECX & (1u<<10))!=0)
-      CRCFoldWidth=256;
-  }
-#else
-  CRCFoldWidth=0;
+#ifdef CRCFOLD_HAVE_256
+  if (!HasOSXsave || !HasAVX || MaxLeaf<7)
+    return;
+
+  // The OS must have enabled XMM (bit 1) and YMM (bit 2) state saving,
+  // otherwise AVX registers are not preserved across context switches.
+  if ((CRCFoldXcr0() & 6)!=6)
+    return;
+
+  CRCFoldCpuid(7,0,Regs);
+  bool HasAVX2   =(Regs[1] & (1u<< 5))!=0; // CPUID.7.0:EBX[5]
+  bool HasVpclmul=(Regs[2] & (1u<<10))!=0; // CPUID.7.0:ECX[10]
+
+  if (HasAVX2 && HasVpclmul)
+    CRCFoldWidth=256;
 #endif
+
+  // Diagnostic override: UNRAR_CRC_FOLD=0|128|256 selects a path at run time,
+  // so the three can be compared within a single binary instead of building
+  // one executable per configuration - which removes build differences, and
+  // anti-virus first-run scanning, as sources of measurement error.
+  //
+  // It can only narrow what detection found, never enable an unsupported
+  // path, so it cannot be used to crash on a CPU lacking the instructions.
+  const char *Env=getenv("UNRAR_CRC_FOLD");
+  if (Env!=NULL && *Env!=0)
+  {
+    uint Want=(uint)atoi(Env);
+    if (Want<128)
+      CRCFoldWidth=0;
+    else if (Want<256 && CRCFoldWidth>128)
+      CRCFoldWidth=128;
+  }
+}
+
+
+// Single entry point: picks the widest available path. Keeps the width
+// logic here rather than in crc.cpp, so the call site needs no #ifdef.
+// 'inline' only to avoid an unused-function warning in crcbench, which
+// includes this file but calls the two widths directly to compare them.
+static inline uint CRCFoldBlocks(uint StartCRC,const byte *Data,size_t Blocks)
+{
+#ifdef CRCFOLD_HAVE_256
+  if (CRCFoldWidth>=256)
+    return CRCFold256(StartCRC,Data,Blocks);
+#endif
+  return CRCFold128(StartCRC,Data,Blocks);
 }
