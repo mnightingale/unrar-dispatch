@@ -422,11 +422,14 @@ for nothing.
 
 Two things to be careful of when reading a `bench.sh` table:
 
-- **The `cost` columns need a low-noise row to mean anything.** They are
-  differences against the no-CRC baseline, so on a 25 ms measurement with 11%
-  spread a 1 ms "cost" is not a number. The `pool` column is a direct
-  1-thread-versus-pool comparison and does not have that problem — prefer it.
-  `rar5-mid1m-m0` at `FOLD=256` is the row to re-run with `-n 15` if it matters.
+- **A `short` label is not a small effect, it is no measurement.** Rows under
+  100 ms cannot resolve a few percent however tight the spread looks, and at
+  folding speed most of the corpus lands there. Rebuild bigger
+  (`make-corpus.sh -s 512` or `-s 1024`) rather than reading those rows.
+- **More runs does not make a row more significant.** The band is an
+  interquartile spread on medians precisely so `-n 5` and `-n 15` are
+  comparable; raising `-n` tightens the median but will not rescue a run that is
+  too short. See *The open question*.
 - **Windows.** `ResetFileCache` ([extract.cpp:244](../extract.cpp)) purges the
   archive before `unrar t`, so stored rows there are I/O-bound and understate
   both the win and the regression — the trap
