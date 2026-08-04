@@ -15,6 +15,10 @@
 # Adds archives to the corpus rather than regenerating it, so an existing
 # corpus on a benchmark box stays valid. Roughly 400 MB of extra disk.
 #
+# Note dispatch/make-corpus.sh starts with `rm -rf` on its output directory, so
+# re-run this after any regeneration or these archives quietly disappear from
+# bench.sh's table.
+#
 # Usage: crcmt/add-midsize-corpus.sh [-c corpusdir]
 
 set -eu

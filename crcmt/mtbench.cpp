@@ -25,6 +25,16 @@
 //             (copy+crc) - (copy), isolating the CRC while keeping the cache
 //             state honest.
 //
+//             The source is a region much larger than last-level cache, read at
+//             a rotating offset, because that turned out to matter more than
+//             anything else here. An earlier version copied from one small fixed
+//             source, so the whole working set stayed resident in L3 for the
+//             length of the run and the pooled 4 MB figure came out 4x higher
+//             than `unrar t` measured on the same machine. unrar reuses one 4 MB
+//             buffer but streams gigabytes of archive through the cache to fill
+//             it, evicting that buffer between calls; a benchmark whose entire
+//             working set fits in L3 is measuring a case that never happens.
+//
 // Also measured are the two costs the pool adds regardless of how fast CRC32
 // is: the dispatch/join round trip per Update() call, and the Galois combine
 // per block. Those are what decide the threshold in UpdateCRC32MT.
@@ -144,8 +154,12 @@ static Result Resident(byte *Buf,size_t Size,uint Threads,double MinSec)
 // Buffer written by this thread, then CRC'd. Runs the copy alone and the copy
 // plus CRC, and reports the difference, normalized per byte so the two passes
 // need not have completed the same number of iterations.
-static Result Producer(byte *Dst,const byte *Src,size_t Size,uint Threads,
-                       double MinSec)
+//
+// SrcSize is deliberately far larger than any last-level cache and the read
+// offset rotates through it, so the cache is being churned exactly as it is
+// while unrar streams an archive through a reused buffer. See the header note.
+static Result Producer(byte *Dst,const byte *Src,size_t SrcSize,size_t Size,
+                       uint Threads,double MinSec)
 {
   DataHash Hash;
   Hash.Init(HASH_CRC32,Threads);
@@ -156,12 +170,18 @@ static Result Producer(byte *Dst,const byte *Src,size_t Size,uint Threads,
   {
     bool WithCRC=Pass==1;
     uint64 Done=0;
+    size_t Offset=0;
     double Start=Now(),CpuStart=CpuNow(),Elapsed;
     do
     {
       for (uint I=0;I<8;I++,Done+=Size)
       {
-        memcpy(Dst,Src,Size);
+        // Both passes walk the source identically, so whatever the streaming
+        // costs cancels in the subtraction.
+        if (Offset+Size>SrcSize)
+          Offset=0;
+        memcpy(Dst,Src+Offset,Size);
+        Offset+=Size;
         if (WithCRC)
           Hash.Update(Dst,Size);
       }
@@ -235,8 +255,8 @@ static void FixedCosts(double MinSec)
 }
 
 
-static void Throughput(byte *Dst,const byte *Src,bool ProducerModel,
-                       double MinSec)
+static void Throughput(byte *Dst,const byte *Src,size_t SrcSize,
+                       bool ProducerModel,double MinSec)
 {
   printf("\n=== %s ===\n",ProducerModel ?
     "producer: buffer written by this thread first (unrar's real pattern)" :
@@ -250,7 +270,7 @@ static void Throughput(byte *Dst,const byte *Src,bool ProducerModel,
     for (uint I=0;I<ASIZE(BenchThreads);I++)
     {
       Result R=ProducerModel ?
-        Producer(Dst,Src,BenchSizes[S],BenchThreads[I],MinSec) :
+        Producer(Dst,Src,SrcSize,BenchSizes[S],BenchThreads[I],MinSec) :
         Resident(Dst,BenchSizes[S],BenchThreads[I],MinSec);
       GbS[I]=R.GbS;
       Cores[I]=R.Cores;
@@ -280,13 +300,18 @@ int main(int argc,char *argv[])
   printf("%.2f s minimum per measurement\n",MinSec);
 
   const size_t MaxSize=BenchSizes[ASIZE(BenchSizes)-1];
-  std::vector<byte> Src(MaxSize),Dst(MaxSize);
-  for (size_t I=0;I<MaxSize;I++)
+  // 4x the largest measured buffer, and comfortably past any current L3, so the
+  // producer model cannot run entirely out of cache.
+  const size_t SrcSize=4*MaxSize;
+  std::vector<byte> Src(SrcSize),Dst(MaxSize);
+  for (size_t I=0;I<SrcSize;I++)
     Src[I]=(byte)(I*2654435761u >> 13);
   memcpy(Dst.data(),Src.data(),MaxSize);
+  printf("%llu MB source region, %llu MB destination buffer\n",
+         (unsigned long long)(SrcSize>>20),(unsigned long long)(MaxSize>>20));
 
   FixedCosts(MinSec);
-  Throughput(Dst.data(),Src.data(),false,MinSec);
-  Throughput(Dst.data(),Src.data(),true,MinSec);
+  Throughput(Dst.data(),Src.data(),SrcSize,false,MinSec);
+  Throughput(Dst.data(),Src.data(),SrcSize,true,MinSec);
   return 0;
 }
