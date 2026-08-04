@@ -47,8 +47,8 @@ Four findings, in order of how much they should change the code:
 
 2. **The pool now costs more than the work it is parallelising.** On
    `rar5-exe-m5`, folded CRC32 is 4.7 ms of a 580 ms run when left on the
-   calling thread — 0.8%. Pooled, the same checksum costs 26.5 ms, or 4.6%. The
-   overhead is over five times the job.
+   calling thread — 0.8%. Pooled, the same checksum costs 26.5 ms, or 4.6%:
+   21.8 ms of overhead to parallelise 4.7 ms of work.
 
 3. **The current 32 KB threshold was too low even for the table CRC.**
    `rar5-mid64k-m0` loses 5.1% at `FOLD=0`. That regression predates folding
