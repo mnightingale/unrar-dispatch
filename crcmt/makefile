@@ -15,7 +15,10 @@
 #
 
 CXX=c++
-CXXFLAGS=-O2 -std=c++11 -Wno-logical-op-parentheses -Wno-switch -Wno-dangling-else
+# No -Wno-* flags: those exist in the top-level makefile for upstream code
+# patterns, they are clang spellings, and GCC reports them as unrecognized.
+# mtbench.cpp is local code and should compile clean without them.
+CXXFLAGS=-O2 -std=c++11
 DEFINES=-D_FILE_OFFSET_BITS=64 -D_LARGEFILE_SOURCE -DRAR_SMP -DUNRAR
 DIR=$(dir $(lastword $(MAKEFILE_LIST)))
 ROOT=$(DIR)..

@@ -30,8 +30,13 @@
 // per block. Those are what decide the threshold in UpdateCRC32MT.
 
 #include "rar.hpp"
-#include <cstdio>
+#include <stdio.h>
 #include <vector>
+// rar.hpp happens to pull these in on macOS but not on glibc, and this file
+// needs both directly: getrusage for the CPU-time columns, clock_gettime for
+// the timings.
+#include <sys/resource.h>
+#include <time.h>
 
 static const size_t BenchSizes[]={16u<<10,32u<<10,64u<<10,256u<<10,1u<<20,
                                   4u<<20,16u<<20,64u<<20};
