@@ -223,7 +223,15 @@ file I/O, and analyses it with `xperf -a profile`.
 .\dispatch\profile-win.ps1 -AnalyzeOnly -Etl dispatch\unrar-profile.etl -SymbolPath "srv*C:\symbols*https://msdl.microsoft.com/download/symbols"
 ```
 
-Three things about this were learned the hard way and are encoded in the
+**`unrar t` is the wrong command for measuring CPU work on Windows.** The test
+command purges the archive from the file cache before reading it
+(`ResetFileCache`, [extract.cpp:244](../extract.cpp)) — Windows-only, and not
+done for extraction. Every read then pays for a cold cache, which swamps
+decode- and checksum-side gains and makes Windows `t` numbers incomparable to
+Linux `t` numbers. Use `x`, or suppress the purge. See
+[winread/README.md](../winread/README.md).
+
+Three things about profiling were learned the hard way and are encoded in the
 script, so they do not have to be rediscovered:
 
 - **Record with xperf, not WPR.** WPR's built-in profiles pull in managed-code

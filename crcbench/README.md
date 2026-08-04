@@ -388,6 +388,15 @@ build does not.
 
 ### Windows end-to-end results
 
+> **Correction — the Windows numbers below understate the win.** They were
+> measured with `unrar t`, and on Windows the test command deliberately purges
+> the archive from the file cache first (`ResetFileCache`,
+> [extract.cpp:244](../extract.cpp)). Linux has no such call, so the two
+> platforms were never measuring the same thing. On `rar5-store-m0`, folding is
+> worth **+5.1%** under `unrar t` but **+25.1%** under `unrar x`, and +36.2% for
+> `t` with the purge suppressed. See [winread/README.md](../winread/README.md).
+> The table below is left as measured; read it as a floor, not as the result.
+
 Measured on a Ryzen 7 5800X (Zen 3, 8C/16T, 32 GB), Windows 11, VS2022 v143,
 min-of-11, `-mt1`, comparing `UNRAR_CRC_FOLD` modes of one binary:
 
