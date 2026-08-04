@@ -39,6 +39,73 @@ bool HashValue::operator == (const HashValue &cmp) const
 }
 
 
+#ifdef CRCMT_DIAG
+// Diagnostic overrides for crcmt/, following the same pattern as the
+// UNRAR_CRC_FOLD override in crcfold.cpp: read once, no effect unless set.
+//
+//   UNRAR_CRC_MT=<n>          force the CRC32 thread count. 1 keeps unpack
+//                             multithreaded but runs the CRC on the caller,
+//                             i.e. "what if the pool were not used here".
+//   UNRAR_CRC_MINBLOCK=<n>    override MinBlock in UpdateCRC32MT.
+//   UNRAR_CRC_SKIP=1          skip CRC32 entirely, to measure everything else
+//                             in the same run.
+//   UNRAR_CRC_HIST=1          dump a histogram of Update() sizes at exit,
+//                             which is what decides whether the pool is
+//                             reached at all and with how many blocks.
+//
+// Compiled in only with -DCRCMT_DIAG, unlike UNRAR_CRC_FOLD, because
+// UNRAR_CRC_SKIP deliberately produces wrong checksums and must not be
+// reachable in a shipping build.
+static uint64 CrcDiagValue(const char *Name,uint64 Default)
+{
+  const char *Env=getenv(Name);
+  // Base 0, so both 8 and 0x80000 are accepted.
+  return Env==nullptr ? Default : strtoull(Env,nullptr,0);
+}
+
+
+// One bucket per power of two. Written from the calling thread only, same as
+// the rest of Update().
+static uint64 CrcHistCalls[48],CrcHistBytes[48];
+static uint64 CrcHistPooled,CrcHistSerial;
+
+static void CrcHistAdd(size_t Size)
+{
+  uint B=0;
+  while (((size_t)1<<(B+1))<=Size && B<ASIZE(CrcHistCalls)-1)
+    B++;
+  CrcHistCalls[B]++;
+  CrcHistBytes[B]+=Size;
+}
+
+
+struct CrcHistDump
+{
+  ~CrcHistDump()
+  {
+    if (CrcDiagValue("UNRAR_CRC_HIST",0)==0)
+      return;
+    uint64 Total=0;
+    for (uint I=0;I<ASIZE(CrcHistBytes);I++)
+      Total+=CrcHistBytes[I];
+    // stderr, so it does not corrupt piped archive data on stdout.
+    fprintf(stderr,"\nDataHash::Update CRC32 call sizes\n");
+    fprintf(stderr,"%12s %10s %14s %8s\n","size >=","calls","bytes","% bytes");
+    for (uint I=0;I<ASIZE(CrcHistCalls);I++)
+      if (CrcHistCalls[I]!=0)
+        fprintf(stderr,"%12llu %10llu %14llu %7.1f%%\n",
+                (unsigned long long)(I==0 ? 0 : (uint64)1<<I),
+                (unsigned long long)CrcHistCalls[I],
+                (unsigned long long)CrcHistBytes[I],
+                Total==0 ? 0 : 100.0*CrcHistBytes[I]/Total);
+    fprintf(stderr,"pooled calls: %llu   serial calls: %llu\n",
+            (unsigned long long)CrcHistPooled,
+            (unsigned long long)CrcHistSerial);
+  }
+} static CrcHistDumpObj;
+#endif
+
+
 DataHash::DataHash()
 {
   blake2ctx=NULL;
@@ -77,6 +144,14 @@ void DataHash::Init(HASH_TYPE Type,uint MaxThreads)
     blake2sp_init(blake2ctx);
 #ifdef RAR_SMP
   DataHash::MaxThreads=Min(MaxThreads,HASH_POOL_THREADS);
+#ifdef CRCMT_DIAG
+  if (Type==HASH_CRC32)
+  {
+    static uint Forced=(uint)CrcDiagValue("UNRAR_CRC_MT",0);
+    if (Forced!=0)
+      DataHash::MaxThreads=Min(Forced,HASH_POOL_THREADS);
+  }
+#endif
 #endif
 }
 
@@ -89,6 +164,12 @@ void DataHash::Update(const void *Data,size_t DataSize)
 #endif
   if (HashType==HASH_CRC32)
   {
+#ifdef CRCMT_DIAG
+    static uint Skip=(uint)CrcDiagValue("UNRAR_CRC_SKIP",0);
+    if (Skip!=0)
+      return;
+    CrcHistAdd(DataSize);
+#endif
 #ifdef RAR_SMP
     UpdateCRC32MT(Data,DataSize);
 #else
@@ -131,12 +212,22 @@ THREAD_PROC(BuildCRC32Thread)
 // calculate the power of 2 to get "1000" and multiply it by "aaa".
 void DataHash::UpdateCRC32MT(const void *Data,size_t DataSize)
 {
+#ifdef CRCMT_DIAG
+  static size_t MinBlock=(size_t)CrcDiagValue("UNRAR_CRC_MINBLOCK",0x4000);
+#else
   const size_t MinBlock=0x4000;
+#endif
   if (DataSize<2*MinBlock || MaxThreads<2)
   {
+#ifdef CRCMT_DIAG
+    CrcHistSerial++;
+#endif
     CurCRC32=CRC32(CurCRC32,Data,DataSize);
     return;
   }
+#ifdef CRCMT_DIAG
+  CrcHistPooled++;
+#endif
 
   if (ThPool==nullptr)
     ThPool=new ThreadPool(HASH_POOL_THREADS);
