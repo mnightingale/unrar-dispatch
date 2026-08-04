@@ -209,6 +209,55 @@ missing variant walks down v3 → v2 → baseline; `argv` passes through exactly
 spaces and all; an unknown `UNRAR_ISA` and total lookup failure both exit 2
 (`RARX_FATAL`, `errhnd.hpp:8`).
 
+## Profiling on Windows
+
+`bench.ps1` says which archives are slow; `profile-win.ps1` says where the time
+goes inside one. It records a 1 kHz sampled-CPU ETW trace with stacks, plus
+file I/O, and analyses it with `xperf -a profile`.
+
+```
+# elevated - ETW kernel sessions require it
+.\dispatch\profile-win.ps1 -Exe build\unrar64\Release\unrar.exe -Archive dispatch\corpus\rar5-store-m0.rar
+
+# analysis needs no elevation, and can be re-run with symbols
+.\dispatch\profile-win.ps1 -AnalyzeOnly -Etl dispatch\unrar-profile.etl -SymbolPath "srv*C:\symbols*https://msdl.microsoft.com/download/symbols"
+```
+
+Three things about this were learned the hard way and are encoded in the
+script, so they do not have to be rediscovered:
+
+- **Record with xperf, not WPR.** WPR's built-in profiles pull in managed-code
+  providers, and `xperf -a profile` then aborts on the first .NET event with
+  `HRESULT 0x80070032` — it cannot analyse a recording WPR just made. A
+  kernel-only xperf trace analyses cleanly and needs no hand-written
+  `.wpaProfile`. `-UseWpr` remains for when something else holds the single
+  shared NT Kernel Logger.
+- **Verify the session started, do not trust the exit code.** `xperf -on` has
+  returned 0 without creating a session, which silently runs the whole workload
+  untraced and then merges nothing. The script checks `xperf -loggers`.
+- **`$ErrorActionPreference = "Stop"` is wrong for driving these tools.** They
+  write banners and benign warnings to stderr, and under `Stop` that alone
+  raises a terminating error — a harmless "no session to stop" during cleanup
+  will kill the script before it does any work. Exit codes are checked
+  explicitly instead.
+
+- **`-a profile` needs `-detail`, and is the only action to trust for CPU
+  time.** Without `-detail` it emits a per-CPU utilisation summary that says
+  nothing about where time went. And do not reach for `xperf -a stack`
+  instead: that action counts every event carrying a stack, so on a trace
+  containing `FILE_IO` the file-I/O stacks swamp the CPU samples and
+  `EtwpTraceStackWalk` appears to be 59% of the machine. It is not — in the
+  sampled profile ETW is about 1%. `stack -butterfly` is for call
+  relationships (it is how the read path below was traced through unrar into
+  the cache manager); `profile -detail` is for magnitudes.
+
+Symbol decoding is opt-in via `-SymbolPath`, because otherwise xperf reaches
+for the public symbol server and stalls. For function names inside unrar you
+need a PDB matching that exact binary: MSBuild rewrites `UnRAR.pdb` on every
+build, so a PDB left from a later build will not match a renamed earlier exe
+and you will silently get module-level attribution only. Copy the PDB aside at
+build time when profiling a specific binary.
+
 ## Correctness gate
 
 `verify-parity.sh` is the check that matters — a variant that decodes fast but
@@ -242,6 +291,9 @@ across variants.
 | `build-variants.sh` | Builds one binary per ISA level via the `CPPFLAGS` hook |
 | `make-corpus.sh` | Generates the benchmark archives (needs `rar`) |
 | `bench.sh` | Per-archive min-of-N timings with noise floor, `-mt1` and default threads |
+| `bench.ps1` | Windows equivalent of `bench.sh`, plus `-FoldModes` within one binary |
+| `check-builds.ps1` | Confirms two Windows builds differ only in the CRC define |
+| `profile-win.ps1` | ETW CPU-sampling trace of unrar on Windows (needs elevation) |
 | `audit-isa.sh` | Attributes ISA instructions to enclosing functions |
 | `verify-parity.sh` | Correctness gate across variants |
 | `unrar-dispatch.c` | The x86-64 runtime dispatcher |
