@@ -119,32 +119,53 @@ if [ -z "$FOLDS" ]; then
   fi
 fi
 
-# Min-of-N wall clock plus the CPU time of that same fastest run, in ms.
+# Per-archive timing. Prints "min_ms median_ms iqr_pct cpu_ms".
+#
 # Timing happens inside one python3 process; spawning an interpreter per sample
-# would add tens of milliseconds of noise. The minimum is reported rather than
-# the mean because it is the sample least polluted by scheduler interference.
-# Prints "min_ms cpu_ms spread_pct", spread being (median-min)/min.
+# would add tens of milliseconds of noise.
+#
+# The verdict is decided on *medians*, not minima, and the noise band is the
+# interquartile spread. That is a deliberate change from dispatch/bench.sh,
+# which used min-of-N with (median-min)/min as its band: that band grows with N,
+# because more samples find a lower minimum while the median barely moves. A
+# row read as a solid result at -n 5 and as noise at -n 15 with no underlying
+# change, purely from that. Median and IQR are both stable in N, so two runs at
+# different -n are comparable. The minimum is still printed, since it is the
+# sample least polluted by scheduler interference and useful for reading rates
+# off, but nothing is decided on it.
 best_ms() {
   runs=$1; shift
   python3 -c '
 import resource, subprocess, sys, time
 runs = int(sys.argv[1])
 cmd = [a for a in sys.argv[2:] if a]
+# One untimed warmup: the first read pulls the archive into page cache.
 subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-samples = []
+walls, cpus = [], []
 for _ in range(runs):
     r0 = resource.getrusage(resource.RUSAGE_CHILDREN)
     t = time.perf_counter()
     subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    wall = (time.perf_counter() - t) * 1000
+    walls.append((time.perf_counter() - t) * 1000)
     r1 = resource.getrusage(resource.RUSAGE_CHILDREN)
-    cpu = ((r1.ru_utime - r0.ru_utime) + (r1.ru_stime - r0.ru_stime)) * 1000
-    samples.append((wall, cpu))
-samples.sort()
-lo, cpu = samples[0]
-med = samples[len(samples) // 2][0]
-print(round(lo, 1), round(cpu, 1), round((med - lo) / lo * 100, 1))
+    cpus.append(((r1.ru_utime - r0.ru_utime) + (r1.ru_stime - r0.ru_stime)) * 1000)
+
+order = sorted(range(len(walls)), key=lambda i: walls[i])
+walls_s = [walls[i] for i in order]
+
+def pct(v, q):
+    if len(v) == 1:
+        return v[0]
+    i = (len(v) - 1) * q
+    lo, hi = int(i), min(int(i) + 1, len(v) - 1)
+    return v[lo] + (v[hi] - v[lo]) * (i - lo)
+
+med = pct(walls_s, 0.5)
+iqr = pct(walls_s, 0.75) - pct(walls_s, 0.25)
+print(round(walls_s[0], 1), round(med, 1),
+      round(iqr / med * 100, 1) if med else 0.0,
+      round(cpus[order[0]], 1))
 ' "$runs" "$@"
 }
 
@@ -152,7 +173,7 @@ if [ -n "$MINBLOCK" ]; then
   export UNRAR_CRC_MINBLOCK=$MINBLOCK
 fi
 
-echo "runs per measurement: $RUNS (min-of-N)   unrar flags: ${MTFLAG:-default threads}"
+echo "runs per measurement: $RUNS   unrar flags: ${MTFLAG:-default threads}"
 echo "MinBlock: ${MINBLOCK:-0x4000 (default)}"
 
 for fold in $FOLDS; do
@@ -171,7 +192,7 @@ for fold in $FOLDS; do
 
   printf '%-22s %8s %9s %9s   %9s %9s %8s %7s %6s\n' \
     archive no-CRC "CRC 1thr" "CRC pool" "cost 1thr" "cost pool" \
-    "pool" "cores" "noise"
+    "pool" "cores" "iqr"
 
   for arc in "$CORPUS"/*.rar; do
     case $(basename "$arc") in
@@ -185,36 +206,46 @@ for fold in $FOLDS; do
 
     export UNRAR_CRC_SKIP=1
     set -- $(best_ms "$RUNS" "$EXE" t "$MTFLAG" "$pw" -y "$arc")
-    skip=$1; noise=$3
+    skipmed=$2; skipiqr=$3
     unset UNRAR_CRC_SKIP
 
     export UNRAR_CRC_MT=1
     set -- $(best_ms "$RUNS" "$EXE" t "$MTFLAG" "$pw" -y "$arc")
-    one=$1; onenoise=$3
+    onemed=$2; oneiqr=$3
     unset UNRAR_CRC_MT
 
     set -- $(best_ms "$RUNS" "$EXE" t "$MTFLAG" "$pw" -y "$arc")
-    pool=$1; poolcpu=$2; poolnoise=$3
+    poolmed=$2; pooliqr=$3; poolcpu=$4
 
     printf '%-22s %7sms %8sms %8sms   ' \
-      "$(basename "$arc" .rar)" "$skip" "$one" "$pool"
+      "$(basename "$arc" .rar)" "$skipmed" "$onemed" "$poolmed"
     python3 -c "
-skip, one, pool, cpu = $skip, $one, $pool, $poolcpu
-noise = max($noise, $onenoise, $poolnoise)
+skip, one, pool, cpu = $skipmed, $onemed, $poolmed, $poolcpu
+band = max($skipiqr, $oneiqr, $pooliqr)
 d = (one - pool) / one * 100
-verdict = 'noise' if abs(d) <= noise else ('' if d > 0 else 'SLOWER')
-print(f'{one-skip:8.1f}ms {pool-skip:8.1f}ms {d:+7.1f}% {cpu/pool:7.2f} {noise:5.1f}% {verdict}')"
+verdict = 'noise' if abs(d) <= band else ('' if d > 0 else 'SLOWER')
+# A few percent cannot be resolved on a run this short whatever the spread
+# says, so label it rather than letting it read as a measurement.
+if pool < 100:
+    verdict = (verdict + ' short').strip()
+print(f'{one-skip:8.1f}ms {pool-skip:8.1f}ms {d:+7.1f}% {cpu/pool:7.2f} {band:5.1f}% {verdict}')"
   done
 done
 
 cat <<'EOF'
 
-no-CRC    = UNRAR_CRC_SKIP=1: the same run with CRC32 removed (checksums wrong)
+All wall-clock columns are medians of the runs, so they are comparable between
+two invocations with different -n.
+
+no-CRC    = UNRAR_CRC_SKIP=1: the same run with CRC32 removed
 CRC 1thr  = UNRAR_CRC_MT=1: unpack still threaded, CRC on the calling thread
 CRC pool  = unmodified
-cost      = (that column) - (no-CRC): the CRC-attributable wall clock
-pool      = 1thr vs pool wall clock; positive means the pool is faster
-cores     = cpu(user+sys)/wall of the pooled run, i.e. what the pool spends
-noise     = worst run-to-run spread over the three columns; a smaller |pool|
+cost      = (that column) - (no-CRC): the CRC-attributable wall clock. Only
+            meaningful on a row whose iqr is well under the cost being claimed.
+pool      = 1thr vs pool, on medians; positive means the pool is faster
+cores     = cpu(user+sys)/wall of the fastest pooled run
+iqr       = worst interquartile spread over the three columns; a smaller |pool|
             than this is not a result
+short     = the run is under 100 ms, too brief to resolve a few percent at all.
+            Rebuild the corpus larger (make-corpus.sh -s 512) for those rows.
 EOF
