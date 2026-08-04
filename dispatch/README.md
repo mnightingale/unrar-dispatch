@@ -258,6 +258,42 @@ build, so a PDB left from a later build will not match a renamed earlier exe
 and you will silently get module-level attribution only. Copy the PDB aside at
 build time when profiling a specific binary.
 
+### `-mlp` (large memory pages) — tried, not worth shipping
+
+Large pages looked promising because `MiUpdateLargePageCandidateValue` and
+`MiDemoteLocalLargePage` both appear in the profile's top functions. They are
+not the win they look like.
+
+`-mlp` reaches only the `Unpack` window allocator (`extract.cpp:28`), so it can
+reduce TLB pressure in the LZ decode loops and nothing else. It cannot touch
+the read path, which is where the Windows time actually goes, and it does
+nothing at all for stored archives, which bypass `Unpack`. It also needs a
+dictionary of at least `GetLargePageMinimum()` (2 MB) before `new_large`
+(`largepage.cpp:170`) takes the large-page path.
+
+Measured on the 5800X, fold=256, min-of-9, against archives with 32 MB and
+8 MB dictionaries. Deltas run from −2.6% to +6.5% and **every row except one
+sits inside its own noise band**; the exception (`rar5-vol.part01` at default
+threads, +6.5% against 6.1% noise) is marginal and does not reproduce in the
+single-thread run. Single-threaded, all five large-dictionary archives came out
+slightly positive (+0.5% to +3.5%); at default threads the signs are mixed. So
+there may be a real effect of order 1-3%, but this measurement cannot separate
+it from noise, and it is not the Windows bottleneck.
+
+Verify that `-mlp` is actually doing something before trusting any measurement
+of it: `new_large` returns `nullptr` on failure and the caller silently falls
+back to normal pages, so a clean run proves nothing. Large pages need
+contiguous physical memory, which fragments with uptime — the same command can
+work after a reboot and fail hours later. Check by enabling
+`SeLockMemoryPrivilege` and calling `VirtualAlloc(..., MEM_LARGE_PAGES)` for
+the dictionary size directly.
+
+Note also that `-mlp` requires the "Lock pages in memory" privilege, which
+unrar will offer to assign (`cmddata.cpp:678`). That is a genuinely powerful
+privilege — it allows pinning physical memory — so granting it to a user
+account to buy a percent or two of decompression speed is a security trade,
+not a free tuning knob.
+
 ## Correctness gate
 
 `verify-parity.sh` is the check that matters — a variant that decodes fast but
