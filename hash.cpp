@@ -364,6 +364,14 @@ uint DataHash::GetCRC32()
 
 bool DataHash::Cmp(HashValue *CmpValue,byte *Key)
 {
+#ifdef CRCMT_DIAG
+  // A skipped CRC32 cannot match, and reporting a failure per file is not free:
+  // on a 2000-file archive the error formatting made the no-CRC baseline
+  // measurably *slower* than the run it was supposed to be a floor for. Report
+  // a match instead, so the baseline measures only the work being removed.
+  if (HashType==HASH_CRC32 && CrcDiagValue("UNRAR_CRC_SKIP",0)!=0)
+    return true;
+#endif
   HashValue Final;
   Result(&Final);
 #ifndef RAR_NOCRYPT

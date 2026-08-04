@@ -92,8 +92,8 @@ fi
 
 # Confirm the knobs are actually compiled in. Without this check every column
 # would be identical and the run would read as "the pool makes no difference".
-# A skipped CRC must fail the checksum test, so success here means the define
-# was missing.
+# UNRAR_CRC_HIST is the probe because it is the only knob whose presence is
+# directly observable: the others change timing, which is what we are measuring.
 PROBE=""
 for arc in "$CORPUS"/*.rar; do
   case $(basename "$arc") in
@@ -104,13 +104,11 @@ for arc in "$CORPUS"/*.rar; do
 done
 [ -n "$PROBE" ] || { echo "no usable archive in $CORPUS" >&2; exit 1; }
 
-export UNRAR_CRC_SKIP=1
-if "$EXE" t -p- -y "$PROBE" >/dev/null 2>&1; then
-  unset UNRAR_CRC_SKIP
-  echo "!!! UNRAR_CRC_SKIP had no effect: $EXE is not a -DCRCMT_DIAG build" >&2
+if ! UNRAR_CRC_HIST=1 "$EXE" t -inul -p- -y "$PROBE" 2>&1 >/dev/null |
+     grep -q "Update CRC32 call sizes"; then
+  echo "!!! the diag knobs had no effect: $EXE is not a -DCRCMT_DIAG build" >&2
   exit 1
 fi
-unset UNRAR_CRC_SKIP
 
 if [ -z "$FOLDS" ]; then
   if { objdump -d "$EXE" 2>/dev/null || otool -tv "$EXE" 2>/dev/null; } |
