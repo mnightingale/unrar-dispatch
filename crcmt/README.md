@@ -419,7 +419,7 @@ one it took (via `CRCFoldWidth` and `CRC_Neon`):
 | slicing-by-16 | ~4.4 GB/s | 64 KB - 256 KB | `0x10000`-`0x20000` | bracketed by two corpus rows at `FOLD=0` |
 | ARM hw crc32 | ~8.7 GB/s | 256 KB - 1 MB | `0x80000` | bracketed, and `0x80000` verified end-to-end |
 | `fold-256` | 45-57 GB/s | above 4 MB, i.e. never | do not pool | `store-m0` at 1 GB loses 17.0% on 4 MB calls |
-| `fold-128` | 9.9-37.5 GB/s | spans the boundary | **unresolved** | see the caveat below |
+| `fold-128` | 9.9-37.5 GB/s | above 4 MB at both ends measured | do not pool | 4250U loses 3.7-14.7%; top of the range untested |
 
 Evidence per row: at `FOLD=0`, `mid64k` loses 5.1% and `mid256k` wins 16.2%. On
 ARM, `mid256k` loses 25.4% and `mid1m` wins 20.1%, and raising `MinBlock` to
@@ -434,76 +434,85 @@ lives beside the implementation it depends on. Note `UpdateCRC32MT`'s existing
 pooling without a second code path — but watch for overflow if `SIZE_MAX` is
 used literally, since that guard doubles it.
 
-### The fold-128 caveat, and why a feature bit cannot settle it
+### fold-128: measured, and it is not the rate alone that decides
 
-`fold-128` spans a 4x range of rates across microarchitectures, and that range
-straddles the pooling decision. `crcbench` at 1 MB:
+An i5-4250U (Haswell-ULT, 15 W, 2C/4T, 2013) runs `fold-128` at 9.9 GB/s against
+a 2.2 GB/s table — 4.4x — and pooling loses on it almost everywhere. `-s 256`
+corpus, n=7, CRC cost isolated:
 
-| part | `fold-128` | vs its own table |
-| --- | ---: | ---: |
-| i5-4250U (Haswell-ULT, 15 W, 2013) | 9.9 GB/s | 4.4x |
-| Ryzen 7 5800X (Zen 3) | 18.3 GB/s | 4.7x |
-| i5-13500 (Raptor Lake) | 37.5 GB/s | 8.2x |
+| archive | wall 1 thr → pool | CPU 1 thr → pool | pool |
+| --- | ---: | ---: | ---: |
+| rar5-mid64k-m0 | 16.4 → 135.9 ms | 16.2 → 279.4 ms | **-14.7%** |
+| rar5-mid256k-m0 | 11.5 → 45.3 ms | 11.5 → 95.8 ms | **-14.2%** |
+| rar5-exe-m5 | 38.2 → 126.7 ms | 33.6 → 311.1 ms | **-5.2%** |
+| rar5-vol.part01 | 52.9 → 133.4 ms | 53.8 → 343.8 ms | **-4.5%** |
+| rar5-mid1m-m0 | 15.3 → 18.9 ms | 15.4 → 44.8 ms | **-3.7%** |
+| rar5-store-m0 | 31.2 → 28.8 ms | 31.1 → 91.2 ms | +2.5% (noise, short) |
+| rar5-text-m5 | 41.0 → -18.4 ms | 38.9 → 49.7 ms | +7.6% |
 
-Against the two points where pooling a 4 MB call was actually measured:
+The `rar5-mid1m-m0` row is the interesting one. At **8.7 GB/s on the M2 Pro,
+pooling a 1 MB call won by 11.8-20.1%; at 8.6 GB/s here it loses 3.7%.** Nearly
+the same CRC rate, opposite verdict — so the break-even is not a function of the
+rate alone. The M2 Pro has 8 usable cores for the pool to spread across; this
+part has two.
 
-- at **8.7 GB/s** (ARM hardware crc32) pooling **won**, +29 to +32% on stored data
-- at **45.7 GB/s** (`fold-256` on the i5-13500) pooling **lost**, -17 to -20%
+That kills the idea that any single `MinBlock`, or any rate-derived one, is
+sufficient: the threshold depends on how much parallelism is actually available,
+not just on how fast the CRC is. It also means the two ends of `fold-128` agree
+after all, for different reasons — slow-clocked few-core parts lose because
+there is nothing to gain, fast many-core parts lose because the CRC is already
+faster than the coherency traffic. On the evidence, **do not pool when folding is
+active** is the right rule, arrived at from both directions rather than
+extrapolated from one.
 
-The Haswell part sits just above the first and the Raptor Lake part well past the
-second. **So "folding is active" is not a sufficient condition for "do not
-pool".** An earlier revision of this file proposed gating on AVX2, since the
-`PCLMULQDQ` throughput improvement and AVX2 both arrive with Haswell and
-[crcfold.cpp:279](../crcfold.cpp) already reads that bit. The 4250U measurement
-shows why that is not enough: AVX2 separates slow CLMUL from fast CLMUL correctly,
-but every part in the table above has AVX2, and they do not want the same
-threshold.
+Note also that `text-m5`'s pooled column came out *faster than the no-CRC
+baseline*, which is impossible. That run timed the three modes in sequential
+blocks, so drift on a fanless 15 W part landed on whichever mode went last;
+`bench.sh` now interleaves them. The bias was toward flattering the pool, so the
+SLOWER verdicts above are conservative.
 
-There is no feature bit for "CLMUL is 1 cycle rather than 2" — that is the
-Broadwell change, and it is invisible to CPUID. So the options are:
+### The pool counts logical CPUs, not physical ones
 
-1. **Measure once at startup.** Time `fold-128` over a 64 KB buffer in
-   `InitCRC32` and set the threshold from the result. It is the only option
-   correct on every machine, costs perhaps 100 µs once, and is invisible against
-   process startup. The objection is that it puts a timing measurement into a
-   decompressor's initialisation, which is a reasonable thing to dislike.
-2. **Do not pool whenever folding is active.** Correct on Broadwell and later,
-   and gives up perhaps 20-30% of the CRC's share on Haswell-era parts — a
-   bounded loss on a shrinking population, against a CPU-cost win that applies
-   everywhere. This is the simplest thing to ship.
-3. **Pool above 512 KB whenever folding is active.** The mirror image: right for
-   Haswell, leaves the measured 17-20% regression in place on current hardware.
+`GetNumberOfThreads()` ([threadmisc.cpp:178](../threadmisc.cpp)) returns the
+online CPU count, so on the 4250U's 2C/4T it spawns four CRC threads across two
+physical cores. CRC32 is port-bound in both implementations — 16 table loads per
+16 bytes, or a `PCLMULQDQ` chain — so a sibling hyperthread adds no execution
+resources, only coherency traffic and another wakeup to wait on. That is part of
+why this machine loses so consistently, and it applies to the table path too.
 
-Option 2 looks best to me, but it is a judgement about which population to
-disappoint rather than something the measurements decide.
+### Still untested: fast fold-128 on a many-core part
 
-What the measurements *do* settle, and what remains open:
+`fold-128` spans 9.9 GB/s (Haswell-ULT) to 18.3 (Zen 3 5800X) to 37.5 (Raptor
+Lake), and only the bottom of that range has an end-to-end result. The middle
+and top are one command away on the i5-13500, since `UNRAR_CRC_FOLD=128` runs
+`fold-128` at 37.5 GB/s on 6P+8E:
 
-- **`fold-256` implies do not pool.** VPCLMULQDQ means Ice Lake or Zen 4 and
-  later, where folding is 45-57 GB/s, and 4 MB calls lose 17-20% pooled. Directly
-  measured.
-- **The table path keeps the pool**, at a threshold nearer 64-256 KB than 32 KB.
-- **Pre-Haswell `fold-128` is still untested.** The cycle model is now calibrated:
-  the 4250U's 9.86 GB/s implies 2.46 GHz at 4 B/cycle against a 2.6 GHz turbo
-  ceiling, and its table path runs at 0.91 B/cycle — both as predicted. The same
-  model puts Sandy Bridge's `fold-128` at ~1 B/cycle, i.e. ~3.4 GB/s against a
-  ~3.1 GB/s table: a dead heat, so those parts should probably keep the table and
-  the pool. That is now an extrapolation from a validated model rather than from
-  published tables alone, but it is still not a measurement.
+```bash
+crcmt/bench.sh -c dispatch/corpus -f "0 128 256" -n 7
+```
 
-A caveat unrelated to any of the above: every break-even here scales with the
-platform's thread-wakeup cost, so a platform cheaper than Linux futexes would move
-them all down. The ordering does not change.
+The expectation is that it looks like the `fold-256` column, since both are far
+above the rate where the pool can pay for itself. It would close the last cell.
 
-One second-order observation, not worth acting on alone: at 1 MB on ARM, 4
-threads reach 16.05 GB/s against 8 threads' 18.77 for half the CPU. The
-`BlockSize<MinBlock` clamp is the right shape for capping thread count; it is the
-value that is out of date.
+### Pre-Haswell is still untested, and probably does not matter now
 
-**Deleting the pool outright would still be wrong.** It earns +36.6% on the table
-path, which is what non-x86 non-ARM builds and pre-PCLMULQDQ hardware use, and
-the pool object is shared with BLAKE2sp ([hash.hpp:53](../hash.hpp)) — removing
-CRC pooling would not remove the threads, the pool, or its cost, only the benefit.
+The cycle model is calibrated: the 4250U's 9.86 GB/s implies 2.46 GHz at
+4 B/cycle against a 2.6 GHz turbo ceiling, and its table path runs at
+0.91 B/cycle — both as the instruction tables predict. The same model puts Sandy
+Bridge `fold-128` at ~1 B/cycle, i.e. ~3.4 GB/s against a ~3.1 GB/s table: a dead
+heat. Those parts should keep the table and the pool, which is what they get today
+if folding is simply not enabled below AVX2 — a bit
+[crcfold.cpp:279](../crcfold.cpp) already reads.
+
+A caveat unrelated to the above: every break-even here scales with the platform's
+thread-wakeup cost, so a platform cheaper than Linux futexes would move them all
+down. The ordering does not change.
+
+**Deleting the pool outright would still be wrong.** It earns +33.6% on the table
+path on the 4250U and +36.6% on the i5-13500, which is what non-x86 non-ARM builds
+and pre-PCLMULQDQ hardware use, and the pool object is shared with BLAKE2sp
+([hash.hpp:53](../hash.hpp)) — removing CRC pooling would not remove the threads,
+the pool, or its cost, only the benefit.
 
 ## Reproducing
 
