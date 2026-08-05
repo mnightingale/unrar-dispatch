@@ -416,7 +416,8 @@ one it took (via `CRCFoldWidth` and `CRC_Neon`):
 | --- | ---: | --- | --- | --- |
 | slicing-by-16 | ~4.4 GB/s | 64 KB - 256 KB | `0x10000`-`0x20000` | bracketed by two corpus rows at `FOLD=0` |
 | ARM hw crc32 | ~8.7 GB/s | 256 KB - 1 MB | `0x80000` | bracketed, and `0x80000` verified end-to-end |
-| `fold-128` / `fold-256` | 37-52 GB/s | above 4 MB, i.e. never | do not pool | `store-m0` at 1 GB loses 17.0% on 4 MB calls |
+| `fold-256`, or `fold-128` with AVX2 | 37-52 GB/s | above 4 MB, i.e. never | do not pool | `store-m0` at 1 GB loses 17.0% on 4 MB calls |
+| `fold-128` without AVX2 | untested | untested | treat as the table | see the caveat below |
 
 Evidence per row: at `FOLD=0`, `mid64k` loses 5.1% and `mid256k` wins 16.2%. On
 ARM, `mid256k` loses 25.4% and `mid1m` wins 20.1%, and raising `MinBlock` to
@@ -431,23 +432,59 @@ lives beside the implementation it depends on. Note `UpdateCRC32MT`'s existing
 pooling without a second code path — but watch for overflow if `SIZE_MAX` is
 used literally, since that guard doubles it.
 
-### The one caveat left, and it needs hardware nobody here has
+### The one caveat left, and a feature bit that may settle it
 
-**`fold-128` on pre-Haswell parts.** PCLMULQDQ was far slower on Westmere and
-Sandy Bridge than the 37 GB/s measured here, and `fold-128` exists to serve
-exactly those CPUs. If it runs at table-like rates there, they want the table
-row's threshold rather than "do not pool", and a blanket rule on `CRCFoldWidth!=0`
-would cost them the +42% the table path still earns. Gating "do not pool" on
-`fold-256` and giving `fold-128` the ARM tier (`0x80000`) is the conservative
-reading: it gives up a little on modern `fold-128` machines, where the true
-answer is "never", in exchange for not regressing 2010-2012 hardware that cannot
-be tested. Settling it needs a Westmere or Sandy Bridge box and one
-`crcbench` run.
+**`fold-128` on pre-Haswell parts.** `PCLMULQDQ` was far slower before Haswell
+than on current parts, and `fold-128` exists to serve exactly those CPUs. If it
+runs at table-like rates there, a blanket "folding is active, so do not pool"
+rule would cost them the +36.6% the pooled table path still earns, while giving
+them nothing in return. That is the one way this recommendation could do harm.
 
-A second, smaller caveat: every break-even above scales with the platform's
-thread-wakeup cost, so a platform cheaper than Linux futexes would move them all
-down. The ordering does not change, and the folding row cannot move — it is
-already past the largest buffer in the program.
+From published instruction tables (Agner Fog, Intel's optimisation manual — not
+measured here, and worth checking against any old hardware that turns up),
+reciprocal throughput for `PCLMULQDQ`, against the 8 of them `fold-128` issues
+per 64 bytes:
+
+| generation | recip. throughput | implies |
+| --- | ---: | ---: |
+| Westmere, Sandy Bridge, Ivy Bridge (2010-12) | 8 cycles | ~1 B/cycle |
+| **Haswell (2013)** | **2 cycles** | ~4 B/cycle |
+| Broadwell, Skylake and later | 1 cycle | ~8 B/cycle |
+
+At ~1 B/cycle a Sandy Bridge part would fold at roughly 3.5 GB/s, which is a dead
+heat with slicing-by-16 — so the concern is real rather than theoretical.
+
+**The proxy: AVX2.** That 1 → 4 B/cycle jump happens at Haswell, and Haswell is
+also where AVX2 arrives. Westmere has neither AVX nor AVX2; Sandy Bridge and Ivy
+Bridge have AVX but not AVX2. So `CPUID.7.0:EBX[5]` separates the slow-CLMUL
+generations from the fast ones, and [crcfold.cpp:279](../crcfold.cpp) already
+reads that bit for the 256-bit gate — it is available at no cost and needs no
+family/model table, which this codebase rightly avoids.
+
+That gives a rule expressible in what is already detected:
+
+- `fold-256` (implies AVX2): do not pool.
+- `fold-128` **with** AVX2 — Haswell through Comet Lake: do not pool.
+- `fold-128` **without** AVX2 — Westmere, Sandy Bridge, Ivy Bridge: keep the
+  table's threshold, and quite possibly do not use folding at all.
+
+Treat AVX2 as a proxy rather than a guarantee: it is a strong one on Intel, where
+both changes landed in the same generation, and roughly holds on AMD (Excavator
+and Zen have AVX2 and fast CLMUL; Bulldozer and Piledriver have neither). It is
+not a substitute for measuring a pre-Haswell part, but it is a defensible line
+to ship without one.
+
+**What would confirm it.** A Westmere, Sandy Bridge or Ivy Bridge part and a
+single `crcbench` run — no corpus needed. Failing that, the *lowest-clocked*
+AVX2 part available confirms the other side of the line: if `fold-128` beats the
+table there, it beats it on every AVX2 machine, since both implementations scale
+with clock and the ratio is what matters. A 15 W Haswell-ULT part is the ideal
+candidate for that, being about as slow as an AVX2 CPU gets.
+
+A second caveat, unrelated: every break-even in the table above scales with the
+platform's thread-wakeup cost, so a platform cheaper than Linux futexes would
+move them all down. The ordering does not change, and the folding row cannot
+move — it is already past the largest buffer in the program.
 
 One second-order observation, not worth acting on alone: at 1 MB on ARM, 4
 threads reach 16.05 GB/s against 8 threads' 18.77 for half the CPU. The
@@ -455,10 +492,10 @@ threads reach 16.05 GB/s against 8 threads' 18.77 for half the CPU. The
 value that is out of date.
 
 **Deleting the pool outright would still be wrong**, even though it is dead
-weight on every modern x86. It earns +42% on the table path, which is what
-non-x86 non-ARM builds use, and the pool object is shared with BLAKE2sp
-([hash.hpp:53](../hash.hpp)) — removing CRC pooling would not remove the threads,
-the pool, or its cost, only the benefit.
+weight on every modern x86. It earns +36.6% on the table path, which is what
+non-x86 non-ARM builds and pre-AVX2 hardware use, and the pool object is shared
+with BLAKE2sp ([hash.hpp:53](../hash.hpp)) — removing CRC pooling would not
+remove the threads, the pool, or its cost, only the benefit.
 
 ## Reproducing
 
