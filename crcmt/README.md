@@ -135,7 +135,8 @@ What holds up unchanged, from the 256 MB runs where the rows were long enough:
 - **Below ~512 KB the pool is a large loss at folding speed** — 12-18% of total
   wall clock on `mid256k` and `mid64k`, at 1.4-5.8% spread.
 - **The 32 KB threshold is too low even for the table CRC**: `mid64k` loses 5.1%
-  at `FOLD=0`. That regression predates folding and ships today.
+  at `FOLD=0` on the i5-13500 and **11.3% at 0.3% spread** on the i5-4250U. That
+  regression predates folding and ships today.
 - **The pool remains right for the table path** (+36.6% on stored data at
   `FOLD=0` on the i5-13500) and marginal for ARM's hardware crc32 (+29% on
   stored, -25 to -60% on 32 KB - 512 KB calls). The threshold has to be a
@@ -145,11 +146,12 @@ Note the mid-size arms are absent from the 1 GB tables above:
 `make-corpus.sh` deletes its output directory, so `add-midsize-corpus.sh` has to
 be re-run after regenerating. Their figures come from the 256 MB runs.
 
-**Measured on**: Intel i5-13500 (Raptor Lake, 6P+8E), Linux/GCC, for the folding
-tables; Apple M2 Pro (8P+4E), macOS 15, Apple clang, for the ARM ones; and Intel
-i5-4250U (Haswell-ULT, 15 W dual-core, 2013) for the `fold-128`-only case, which
-is the first real hardware to exercise the 128-bit path and the CPUID branch that
-selects it. The i5-13500's slicing-by-16 measures 4.6 GB/s single-threaded,
+**Measured on**: Intel i5-13500 (Raptor Lake, 6P+8E), Linux/GCC, for the
+`fold-256` tables; Apple M2 Pro (8P+4E), macOS 15, Apple clang, for the ARM ones;
+and Intel i5-4250U (Haswell-ULT, 15 W dual-core, 2013) for `fold-128`, being the
+first real hardware to exercise the 128-bit path and the CPUID branch selecting
+it. Three CPU vendors' worth of core counts, from 2 to 14, which is what showed
+the break-even depends on parallelism and not only on the CRC rate. The i5-13500's slicing-by-16 measures 4.6 GB/s single-threaded,
 against `crcbench`'s standalone 4.1 on comparable hardware.
 
 ### Dispatch cost is platform-specific, and it explains the ARM/x86 gap
@@ -438,38 +440,66 @@ used literally, since that guard doubles it.
 
 An i5-4250U (Haswell-ULT, 15 W, 2C/4T, 2013) runs `fold-128` at 9.9 GB/s against
 a 2.2 GB/s table — 4.4x — and pooling loses on it almost everywhere. `-s 256`
-corpus, n=7, CRC cost isolated:
+corpus, n=7, modes interleaved, CRC cost isolated:
 
-| archive | wall 1 thr → pool | CPU 1 thr → pool | pool |
-| --- | ---: | ---: | ---: |
-| rar5-mid64k-m0 | 16.4 → 135.9 ms | 16.2 → 279.4 ms | **-14.7%** |
-| rar5-mid256k-m0 | 11.5 → 45.3 ms | 11.5 → 95.8 ms | **-14.2%** |
-| rar5-exe-m5 | 38.2 → 126.7 ms | 33.6 → 311.1 ms | **-5.2%** |
-| rar5-vol.part01 | 52.9 → 133.4 ms | 53.8 → 343.8 ms | **-4.5%** |
-| rar5-mid1m-m0 | 15.3 → 18.9 ms | 15.4 → 44.8 ms | **-3.7%** |
-| rar5-store-m0 | 31.2 → 28.8 ms | 31.1 → 91.2 ms | +2.5% (noise, short) |
-| rar5-text-m5 | 41.0 → -18.4 ms | 38.9 → 49.7 ms | +7.6% |
+| archive | wall 1 thr → pool | CPU 1 thr → pool | pool | iqr |
+| --- | ---: | ---: | ---: | ---: |
+| rar5-mid64k-m0 | 14.9 → 129.8 ms | 14.9 → 269.4 ms | **-14.1%** | 0.3% |
+| rar5-mid256k-m0 | 14.8 → 44.7 ms | 14.9 → 93.8 ms | **-12.4%** | 0.8% |
+| rar5-exe-m5 | 26.5 → 124.8 ms | 29.2 → 316.6 ms | **-5.8%** | 0.9% |
+| rar5-mid1m-m0 | 12.7 → 18.1 ms | 12.6 → 43.6 ms | **-5.6%** | 3.2% |
+| rar5-vol.part01 | 51.0 → 143.1 ms | 48.7 → 337.7 ms | **-5.2%** | 1.6% |
+| rar5-store-m0 | 29.3 → 29.1 ms | 29.2 → 89.8 ms | +0.2% (noise) | 2.9% |
+| rar5-encrypted | 41.0 → -21.1 ms | 44.1 → 49.0 ms | +6.8% (marginal) | 5.4% |
 
-The `rar5-mid1m-m0` row is the interesting one. At **8.7 GB/s on the M2 Pro,
-pooling a 1 MB call won by 11.8-20.1%; at 8.6 GB/s here it loses 3.7%.** Nearly
-the same CRC rate, opposite verdict — so the break-even is not a function of the
-rate alone. The M2 Pro has 8 usable cores for the pool to spread across; this
-part has two.
+Five decisive losses, one marginal win inside its own band, the rest noise.
 
-That kills the idea that any single `MinBlock`, or any rate-derived one, is
-sufficient: the threshold depends on how much parallelism is actually available,
-not just on how fast the CRC is. It also means the two ends of `fold-128` agree
-after all, for different reasons — slow-clocked few-core parts lose because
-there is nothing to gain, fast many-core parts lose because the CRC is already
-faster than the coherency traffic. On the evidence, **do not pool when folding is
-active** is the right rule, arrived at from both directions rather than
+**`rar5-store-m0` is the clearest single row in this whole file.** Its 4 MB calls
+take 29.3 ms on the calling thread and 29.1 ms pooled — identical — while the CPU
+goes from 29.2 to 89.8 ms. The pool spends three times the CPU to achieve exactly
+nothing, and a wall-clock benchmark would record it as a tie.
+
+**`rar5-mid1m-m0` is the one that teaches something.** At **8.7 GB/s on the M2
+Pro, pooling a 1 MB call won by 11.8-20.1%; at 8.6 GB/s here it loses 5.6%.**
+Nearly the same CRC rate, opposite verdict — so the break-even is not a function
+of the rate alone. The M2 Pro has 8 usable cores for the pool to spread across;
+this part has two.
+
+That rules out any single `MinBlock`, and any rate-derived one, as sufficient: the
+threshold depends on how much parallelism is available, not only on how fast the
+CRC is. It also means the two ends of `fold-128` agree after all, for different
+reasons — few-core parts lose because there is nothing to gain, fast many-core
+parts because the CRC is already quicker than the coherency traffic. So **do not
+pool when folding is active** is reached from both directions rather than
 extrapolated from one.
 
-Note also that `text-m5`'s pooled column came out *faster than the no-CRC
-baseline*, which is impossible. That run timed the three modes in sequential
-blocks, so drift on a fanless 15 W part landed on whichever mode went last;
-`bench.sh` now interleaves them. The bias was toward flattering the pool, so the
-SLOWER verdicts above are conservative.
+The table path on the same machine is the sharpest version of the threshold
+finding, because it is unrar exactly as shipped: `mid64k` **-11.3% at 0.3%
+spread**, `mid256k` -3.0%, `exe-m5` -4.7%, `vol` -2.0% — four of eleven rows
+slower with the pool — against `store-m0` +32.4% and `mid1m` +12.2%. The pool is
+right for large buffers on this CRC and wrong for everything under about 512 KB.
+
+#### The interleaving fix, checked against the run it was written for
+
+This machine produced the negative CRC costs that prompted interleaving the three
+modes, so it is also the test of whether that mattered. Same machine, same
+corpus, sequential blocks then interleaved:
+
+| row | before | after |
+| --- | ---: | ---: |
+| rar5-text-m5, `fold-128` | +7.6% | **+2.7% (now noise)** |
+| rar5-store-m0, `fold-128` | +2.5% | **+0.2% (noise)** |
+| rar5-mid1m-m0, `fold-128` | -3.7% | -5.6% |
+| rar5-mid64k-m0, `fold-128` | -14.7% | -14.1% |
+| rar5-mid64k-m0, table | -11.1% | -11.3% |
+
+The two rows that moved materially were both ones where drift had flattered the
+pool, exactly as predicted, and `text-m5` crossed from a result to noise. The
+decisive rows moved by under 2 points, and the spreads tightened across the board
+(most rows now 0.1-1.9% against 0.2-4.1%). One impossible negative survives —
+`encrypted`'s pooled column still reads faster than its own no-CRC baseline — but
+at 5.4% spread on an 878 ms run that is ordinary noise rather than systematic
+drift, and it is why that row is marked marginal.
 
 ### The pool counts logical CPUs, not physical ones
 
