@@ -151,7 +151,7 @@ Intel i5-13500 (Raptor Lake), Linux/GCC, min-of-15, MB/s:
 | 4 MB | 4094 | **7089** | 6093 | 6323 | 37872 | 50624 |
 | 64 MB | 4065 | 6916 | 5940 | 6125 | 19378 | 22167 |
 
-Apple M2 Pro (arm64, Apple clang), min-of-21, MB/s — no folding path there:
+Apple M2 Pro (arm64, Apple clang), min-of-21, MB/s. No folding path there:
 
 | Buffer | slicing-by-16 | braid-2 | braid-3 | braid-4 |
 | ---: | ---: | ---: | ---: | ---: |
@@ -159,8 +159,32 @@ Apple M2 Pro (arm64, Apple clang), min-of-21, MB/s — no folding path there:
 | 1 MB | 3273 | **6828** | 4124 | 4294 |
 | 64 MB | 3301 | **6828** | 4141 | 4253 |
 
-**The idea works: 1.73x on x86, 2.09x on ARM, for no new instructions.** Two
-chains is the sweet spot on both; three and four are worse than two.
+Raspberry Pi 4 (Cortex-A72, aarch64/GCC), min-of-15, MB/s:
+
+| Buffer | slicing-by-16 | braid-2 | braid-3 | braid-4 |
+| ---: | ---: | ---: | ---: | ---: |
+| 64 KB | **899** | 772 | 686 | 593 |
+| 1 MB | **740** | 571 | 454 | 444 |
+| 4 MB | **701** | 532 | 406 | 418 |
+| 64 MB | **699** | 568 | 404 | 388 |
+
+**The idea works on wide cores and backfires on narrow ones.** 1.73x on the
+i5-13500, 2.09x on the M2 Pro, and **0.77x on a Cortex-A72**: a 23% regression at
+2 chains and 40% at 4. So braiding is not a portable win, and anything that ships
+it needs to know which core it is on.
+
+Two chains is the sweet spot wherever it helps at all; three and four are always
+worse than two.
+
+The A72 result is consistent with the ceiling being issue throughput rather than
+latency. That core is 3-wide and retires roughly one load per cycle, and the table
+needs 1.25 loads per byte, so the baseline is already close to a throughput limit
+and there is no stall for a second chain to fill: at 1.5 GHz its 740 MB/s is 0.49
+bytes/cycle, or about 32 cycles for a 16-byte step against a ~20 cycle floor from
+loads alone. The extra chains then pay for bookkeeping and get nothing back.
+Whether the remaining cost is L1 conflict pressure (the A72's L1D is 32 KB
+2-way, against a 16 KB table working set) or scheduling, throughput numbers alone
+cannot say.
 
 ### The ceiling is instruction throughput, and both machines reach it
 
@@ -216,6 +240,50 @@ replicates only one:
    table needs 20 loads and thirty-odd ALU operations for. This is where the
    order of magnitude lives, and no amount of reordering reaches it.
 
+### The bigger ARM finding: the hardware CRC32 path is probably not compiled in
+
+Testing the Pi turned up something that matters more than braiding does.
+
+`USE_NEON_CRC32` is gated on `__ARM_FEATURE_CRC32` ([os.hpp:172](../os.hpp)),
+which is a **compile-time** macro. The runtime `HWCAP_CRC32` check inside
+`InitCRC32` ([crc.cpp:58](../crc.cpp)) only runs if the path was compiled in at
+all. And aarch64's baseline is `armv8-a`, where CRC32 is *optional* — it only
+became mandatory in ARMv8.1 — so GCC without an explicit `-march` does not define
+the macro.
+
+The consequence is that a plain `make` on many ARM systems silently ships the
+table path on hardware that has the instruction. The makefile's own ARM note
+mentions `-march=armv8-a+crypto` for AES and says nothing about `+crc`.
+
+`crcbench` now measures the NEON path and, more usefully, reports the mismatch.
+Built without the flag on a CPU that has the instruction:
+
+```
+  neon-crc32     ARMv8 CRC32, what unrar uses CPU HAS IT, NOT COMPILED IN: add -march=armv8-a+crc
+```
+
+What it is worth, measured on the M2 Pro where Apple clang defines the macro by
+default:
+
+| | slicing-by-16 | `neon-crc32` |
+| ---: | ---: | ---: |
+| 1 MB | 3306 MB/s | **8299 MB/s** (2.51x) |
+
+So on ARM the order of business is arguably: check the build reaches
+`neon-crc32` first, since that is a compiler flag rather than any new code, and
+only then consider braiding. On a Cortex-A72, where braiding is a 23% *loss*,
+the flag is the entire available win.
+
+To measure it on a machine whose default build lacks the macro:
+
+```bash
+make -f crcbench/makefile run CXXFLAGS='-O2 -std=c++11 -Wall -Wextra -march=armv8-a+crc'
+```
+
+Worth confirming on the Pi: `grep -o crc32 /proc/cpuinfo | head -1` should show
+the CPU has it, and the unflagged `crcbench` line above should say it is not
+compiled in.
+
 ### The implementation trap
 
 Splitting the data into blocks and processing them *sequentially* gains nothing:
@@ -226,11 +294,13 @@ commented-out `//#undef USE_THREADS` that makes `UpdateCRC32MT` run its blocks
 serially on the calling thread — it looks like this experiment and is one
 character away, but it would measure sequential blocks and report no gain.
 
-### Worth having anyway
+### Worth having, but not unconditionally
 
-1.7-2.1x for no new instructions, on any architecture, is a real result for
-platforms with no carry-less multiply at all — and unlike folding it needs no
-runtime dispatch. It is a complement to folding rather than a substitute.
+1.7-2.1x for no new instructions is a real result for wide cores with no
+carry-less multiply. But the Cortex-A72 regression means it cannot simply be
+switched on: it would need either a core-width check or a startup measurement,
+which is a good deal more machinery than folding's `CRCFoldWidth` feature test.
+It is a complement to folding rather than a substitute, and a conditional one.
 
 It also has a bearing on the thread pool. `braid-2` reaches 7.1 GB/s on one core,
 against the 12.2 GB/s the pooled table path manages end-to-end on the same

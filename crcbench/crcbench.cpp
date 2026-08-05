@@ -99,6 +99,75 @@ static uint CRC32Slice16(uint StartCRC,const void *Addr,size_t Size)
 }
 
 
+
+/* ------------------------------------------------------------------ */
+/* ARM hardware CRC32, and whether this build can even reach it.         */
+/*                                                                      */
+/* unrar gates USE_NEON_CRC32 on __ARM_FEATURE_CRC32 (os.hpp:172), which */
+/* is a COMPILE-time macro. The runtime HWCAP check in InitCRC32 only    */
+/* runs if the path was compiled in, so a build without the right        */
+/* -march leaves the instruction unreachable on hardware that has it.    */
+/* aarch64's baseline is armv8-a, where CRC32 is optional, so a plain    */
+/* `make` on many ARM systems silently ships the table.                  */
+/*                                                                      */
+/* This file therefore probes the CPU at run time regardless of how it   */
+/* was compiled, so it can report that mismatch rather than hide it.     */
+/* ------------------------------------------------------------------ */
+
+#if defined(__aarch64__) || defined(__arm64__)
+#define CRC_ARM64
+
+#if defined(__APPLE__)
+#include <sys/sysctl.h>
+#elif defined(__linux__)
+#include <sys/auxv.h>
+#include <asm/hwcap.h>
+#endif
+
+/* Does the CPU have the instruction, whatever this build was told? */
+static bool ArmHasCRC32()
+{
+#if defined(__APPLE__)
+  unsigned Value=0;
+  size_t Size=sizeof(Value);
+  return sysctlbyname("hw.optional.armv8_crc32",&Value,&Size,NULL,0)==0 && Value!=0;
+#elif defined(__linux__) && defined(HWCAP_CRC32)
+  return (getauxval(AT_HWCAP) & HWCAP_CRC32)!=0;
+#else
+  return false;
+#endif
+}
+
+#ifdef __ARM_FEATURE_CRC32
+#define CRC_NEON_BUILT
+#include <arm_neon.h>
+
+/* Same loop as crc.cpp:100, which is why it is measured rather than assumed
+   to be faster: on a narrow core the table is not always far behind. */
+static uint CRC32Neon(uint StartCRC,const void *Addr,size_t Size)
+{
+  const byte *Data=(const byte *)Addr;
+  for (;Size>=8;Size-=8,Data+=8)
+  {
+    uint64_t V;
+    memcpy(&V,Data,8); /* compiles to one load; avoids a misaligned cast */
+#ifdef __clang__
+    StartCRC=__builtin_arm_crc32d(StartCRC,V);
+#else
+    StartCRC=__builtin_aarch64_crc32x(StartCRC,V);
+#endif
+  }
+  for (;Size>0;Size--,Data++)
+#ifdef __clang__
+    StartCRC=__builtin_arm_crc32b(StartCRC,*Data);
+#else
+    StartCRC=__builtin_aarch64_crc32b(StartCRC,*Data);
+#endif
+  return StartCRC;
+}
+#endif /* __ARM_FEATURE_CRC32 */
+#endif /* CRC_ARM64 */
+
 /* ------------------------------------------------------------------ */
 /* Braided slicing-by-16: the maintainer's suggestion, implemented.      */
 /*                                                                      */
@@ -296,6 +365,9 @@ static std::vector<Impl> BuildImpls()
   V.push_back({"braid-2", CRC32Braid<2>, true, "no new instructions"});
   V.push_back({"braid-3", CRC32Braid<3>, true, "no new instructions"});
   V.push_back({"braid-4", CRC32Braid<4>, true, "no new instructions"});
+#ifdef CRC_NEON_BUILT
+  V.push_back({"neon-crc32", CRC32Neon, true, "ARMv8 CRC32, what unrar uses"});
+#endif
 #ifdef CRC_FOLD_X86
   CRCFoldDetect();
   V.push_back({"fold-128", Bench128, CRCFoldWidth>=128, "SSE4.1 + PCLMULQDQ"});
@@ -491,6 +563,23 @@ int main(int argc,char *argv[])
   for (size_t K=0;K<Impls.size();K++)
     printf("  %-14s %-28s %s\n",Impls[K].Name,Impls[K].Requires,
            Impls[K].Available ? "available" : "NOT SUPPORTED ON THIS CPU");
+#ifdef CRC_ARM64
+  /* The important case is a CPU that has the instruction while the build
+     cannot reach it, which is silent in unrar and is the default on aarch64
+     since armv8-a leaves CRC32 optional. */
+#ifndef CRC_NEON_BUILT
+  if (ArmHasCRC32())
+    printf("  %-14s %-28s %s\n","neon-crc32","ARMv8 CRC32, what unrar uses",
+           "CPU HAS IT, NOT COMPILED IN: add -march=armv8-a+crc");
+  else
+    printf("  %-14s %-28s %s\n","neon-crc32","ARMv8 CRC32, what unrar uses",
+           "not compiled in, and this CPU lacks it");
+#else
+  if (!ArmHasCRC32())
+    printf("  WARNING: compiled with __ARM_FEATURE_CRC32 but the CPU reports"
+           " no CRC32; neon-crc32 may fault\n");
+#endif
+#endif
   printf("\n");
 
   // Deterministic test data.
