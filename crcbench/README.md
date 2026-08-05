@@ -132,6 +132,78 @@ disturb ISA variants in `dispatch/build`.
 Verified on x86-64 that `-DNO_CRC_FOLD` yields 0 `pclmulqdq` instructions and
 removes every `CRCFold` symbol, while the default build has 24.
 
+## Braided slicing-by-16, and what ILP alone is worth
+
+`braid-2`, `braid-3` and `braid-4` implement the alternative RARLAB raised when
+asked about folding: keep the table algorithm, but split the buffer into blocks
+in a *single* thread so the out-of-order engine can process several at once. They
+use the same tables and the same Galois combine as
+[`UpdateCRC32MT`](../hash.cpp) — it is that function with the thread pool removed
+and the inner loops interleaved.
+
+Measured on an Apple M2 Pro (arm64, Apple clang `-O2`), min-of-21, MB/s:
+
+| Buffer | slicing-by-16 | braid-2 | braid-3 | braid-4 |
+| ---: | ---: | ---: | ---: | ---: |
+| 4 KB | 3285 | 5759 | 3501 | 3294 |
+| 64 KB | 3270 | **6935** | 4089 | 4164 |
+| 1 MB | 3273 | **6828** | 4124 | 4294 |
+| 4 MB | 3281 | **6853** | 4158 | 4249 |
+| 64 MB | 3301 | **6828** | 4141 | 4253 |
+
+**The idea works, and it is worth about 2.1x.** Two chains is the sweet spot;
+three and four are worse than two, most likely register pressure — each chain
+needs its accumulator plus three data words live — though it could also be load
+ports, and x86-64 with half the general-purpose registers may well behave
+differently. Anyone with an x86 box can settle that in a second, which is rather
+the point of putting it here.
+
+**Where the ceiling comes from.** The braid removes stalls, not work. Each 16-byte
+step still issues 20 loads — 16 table lookups and 4 data words — so the table
+approach costs **1.25 loads per byte** no matter how the chains are arranged.
+Against 2-3 load ports that caps it near 2.4 bytes/cycle; `braid-2` reaches about
+1.97, so roughly 80% of the ceiling is already claimed and the remaining chains
+have nothing left to buy. Slicing-by-32 would not help either: it doubles the
+tables to 32 KB and still does one lookup per byte, which is why
+[crc.cpp:138](../crc.cpp) rejects it.
+
+For contrast, per 16 bytes:
+
+| | loads | other |
+| --- | ---: | --- |
+| slicing-by-16 | 20 | ~16 byte extracts, 15 XORs |
+| `fold-128` | 1 | 2 `PCLMULQDQ`, 2 XOR |
+
+So folding's advantage is two separable things, and braiding replicates only one
+of them:
+
+1. **Instruction-level parallelism.** `CRCFold128` keeps four independent
+   accumulators (`Crc0`..`Crc3`, [crcfold.cpp:147](../crcfold.cpp)) and reduces
+   them once at the end — braiding, in registers. This is exactly the suggested
+   idea, and folding already depends on it.
+2. **Work reduction.** Carry-less multiply does in two instructions what the
+   table needs 20 loads and 30-odd ALU operations for. No amount of reordering
+   reaches this, and it is where the order of magnitude lives.
+
+**The implementation trap.** Splitting the data into blocks and processing them
+*sequentially* gains nothing: the reorder window is a few hundred instructions
+and a block is thousands of iterations, so by the time block 2 starts, block 1 has
+long retired. The chains must be interleaved in one loop body. This matters
+because `hash.cpp` has a commented-out `//#undef USE_THREADS` that makes
+`UpdateCRC32MT` run its blocks serially on the calling thread — it looks like this
+experiment and is one character away, but it would measure sequential blocks and
+report no gain.
+
+**Worth having anyway.** 2.1x for no new instructions, on any architecture, is a
+real result for platforms with no carry-less multiply at all — and unlike folding
+it needs no runtime dispatch. It is a complement to folding rather than a
+substitute for it.
+
+Note the 4 KB row is lower (1.75x) because the combine is a fixed cost per call.
+The shift multiplier is cached across calls here, as `UpdateCRC32MT` caches its
+own `StdShift`; without that, `gfExpCRC`'s ~0.5 µs lands on every call and buries
+the 4 KB result entirely.
+
 ## Design notes
 
 **Two widths, deliberately.** The 256-bit path was the starting request, but

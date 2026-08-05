@@ -98,6 +98,150 @@ static uint CRC32Slice16(uint StartCRC,const void *Addr,size_t Size)
   return StartCRC;
 }
 
+
+/* ------------------------------------------------------------------ */
+/* Braided slicing-by-16: the maintainer's suggestion, implemented.      */
+/*                                                                      */
+/* The loop above carries a serial dependency - StartCRC for iteration   */
+/* N+1 cannot begin until iteration N produces it - so the chain is      */
+/* roughly extract-byte, L1 load, XOR tree, about 9 cycles per 16 bytes  */
+/* against a measured ~17. There is idle machine underneath.             */
+/*                                                                      */
+/* Braiding splits the buffer into K blocks and runs K independent       */
+/* chains INTERLEAVED IN ONE LOOP BODY, so the out-of-order engine has   */
+/* K independent chains in flight and one chain's latency overlaps the   */
+/* others' work. Interleaving is the whole point: splitting the data and */
+/* processing the blocks one after another gains nothing, because the    */
+/* reorder window is a few hundred instructions and a block is thousands */
+/* of iterations. (zlib ships a braided CRC in its own crc32.c.)         */
+/*                                                                      */
+/* The partial CRCs are combined with the same Galois shift-and-multiply */
+/* UpdateCRC32MT uses for its threads, copied from hash.cpp - so this is */
+/* precisely that function with the thread pool removed and the inner    */
+/* loops interleaved instead.                                           */
+/* ------------------------------------------------------------------ */
+
+static uint BraidBitReverse32(uint N)
+{
+  uint R=0;
+  for (uint I=0;I<32;I++,N>>=1)
+    R|=(N & 1)<<(31-I);
+  return R;
+}
+
+static uint BraidGfMul(uint A,uint B)
+{
+  const uint POLY=(uint)0x104c11db7;
+  uint R=0;
+  while (A!=0 && B!=0)
+  {
+    R^=(B & 1)!=0 ? A : 0;
+    A=(A<<1)^((A & 0x80000000)!=0 ? POLY : 0);
+    B>>=1;
+  }
+  return R;
+}
+
+static uint BraidGfExp(uint N)
+{
+  uint S=2,R=1;
+  while (N>1)
+  {
+    if ((N & 1)!=0)
+      R=BraidGfMul(R,S);
+    S=BraidGfMul(S,S);
+    N>>=1;
+  }
+  return BraidGfMul(R,S);
+}
+
+/* One 16-byte slicing-by-16 step, identical to the body of the loop in
+   CRC32Slice16. Factored out only so K copies can be interleaved. */
+static inline uint Slice16Step(uint C,const byte *Data)
+{
+  C ^= *(const uint32_t *) Data;
+  uint D1 = *(const uint32_t *) (Data+4);
+  uint D2 = *(const uint32_t *) (Data+8);
+  uint D3 = *(const uint32_t *) (Data+12);
+  return crc_tables[15][(byte) C            ] ^
+         crc_tables[14][(byte)(C  >> 8)     ] ^
+         crc_tables[13][(byte)(C  >> 16)    ] ^
+         crc_tables[12][(byte)(C  >> 24)    ] ^
+         crc_tables[11][(byte) D1           ] ^
+         crc_tables[10][(byte)(D1 >> 8)     ] ^
+         crc_tables[ 9][(byte)(D1 >> 16)    ] ^
+         crc_tables[ 8][(byte)(D1 >> 24)    ] ^
+         crc_tables[ 7][(byte) D2           ] ^
+         crc_tables[ 6][(byte)(D2 >>  8)    ] ^
+         crc_tables[ 5][(byte)(D2 >> 16)    ] ^
+         crc_tables[ 4][(byte)(D2 >> 24)    ] ^
+         crc_tables[ 3][(byte) D3           ] ^
+         crc_tables[ 2][(byte)(D3 >>  8)    ] ^
+         crc_tables[ 1][(byte)(D3 >> 16)    ] ^
+         crc_tables[ 0][(byte)(D3 >> 24)    ];
+}
+
+template<unsigned K>
+static uint CRC32Braid(uint StartCRC,const void *Addr,size_t Size)
+{
+  const byte *Data=(const byte *)Addr;
+
+  /* Same leading alignment as CRC32Slice16, which also makes every chain
+     start 16-aligned since the block size below is a multiple of 16. */
+  for (;Size>0 && ((size_t)Data & 15)!=0;Size--,Data++)
+    StartCRC=crc_tables[0][(byte)(StartCRC^Data[0])]^(StartCRC>>8);
+
+  /* Below this the combine costs more than the chains save, and the
+     correctness sweep exercises every length so the fallback matters. */
+  const size_t MinPerChain=256;
+  if (Size<K*MinPerChain)
+    return CRC32Slice16(StartCRC,Data,Size);
+
+  size_t Block=(Size/K) & ~(size_t)15; /* whole 16-byte steps per chain */
+  size_t Steps=Block/16;
+
+  uint C[K];
+  const byte *P[K];
+  for (unsigned I=0;I<K;I++)
+  {
+    C[I]=0;              /* zero init, so the combine below is a plain XOR */
+    P[I]=Data+I*Block;
+  }
+
+  for (size_t S=0;S<Steps;S++)
+    for (unsigned I=0;I<K;I++) /* K is a constant, so this unrolls */
+    {
+      C[I]=Slice16Step(C[I],P[I]);
+      P[I]+=16;
+    }
+
+  /* Shift the running total left by one block width and XOR in each block's
+     CRC, in order. One multiplier serves all blocks since they are equal.
+     8*Block overflows uint above a 512 MB block, far beyond any Update().
+
+     Cached across calls, because a real implementation would use a fixed block
+     size and hash.cpp already reuses its own StdShift the same way. Without
+     this, gfExpCRC's ~0.5 us lands on every call and buries the result at 4 KB,
+     which would be an artifact of the harness rather than of braiding. */
+  static size_t CachedBlock=0;
+  static uint CachedShift=0;
+  if (Block!=CachedBlock)
+  {
+    CachedBlock=Block;
+    CachedShift=BraidGfExp((uint)(8*Block));
+  }
+  uint Shift=CachedShift;
+  uint Total=StartCRC;
+  for (unsigned I=0;I<K;I++)
+  {
+    Total=BraidBitReverse32(BraidGfMul(BraidBitReverse32(Total),Shift));
+    Total^=C[I];
+  }
+
+  /* Whatever the split could not cover follows the last block. */
+  return CRC32Slice16(Total,Data+K*Block,Size-K*Block);
+}
+
 /* ------------------------------------------------------------------ */
 /* Wrappers pairing the block-only fold functions with the same scalar   */
 /* tail crc.cpp applies, so timings reflect a complete CRC32() call.     */
@@ -147,6 +291,11 @@ static std::vector<Impl> BuildImpls()
 {
   std::vector<Impl> V;
   V.push_back({"slicing-by-16", CRC32Slice16, true, "baseline (current unrar)"});
+  /* Same tables, same arithmetic, only the dependency chain is broken - so
+     these isolate what instruction-level parallelism alone is worth. */
+  V.push_back({"braid-2", CRC32Braid<2>, true, "no new instructions"});
+  V.push_back({"braid-3", CRC32Braid<3>, true, "no new instructions"});
+  V.push_back({"braid-4", CRC32Braid<4>, true, "no new instructions"});
 #ifdef CRC_FOLD_X86
   CRCFoldDetect();
   V.push_back({"fold-128", Bench128, CRCFoldWidth>=128, "SSE4.1 + PCLMULQDQ"});
