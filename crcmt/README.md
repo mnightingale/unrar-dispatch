@@ -17,46 +17,108 @@ crcmt/bench.sh -c dispatch/corpus -b 0x80000   # ...with a raised threshold
 
 ## Status: settled. Where folding is active, do not pool.
 
-A 1 GB corpus resolved the last open row, and it went the way the smaller runs
-hinted but could not prove. On `rar5-store-m0` — one stored file, 4 MB
-`Update()` calls, the largest unrar makes — the folded CRC32 costs **20.6 ms on
-the calling thread and 50.7 ms pooled**. The pool makes the checksum 2.5x more
-expensive and the whole command **17.0% slower**, at 2.4% spread.
+Every cell below is measured on one machine in one run: an Intel i5-13500
+(Raptor Lake, 6P+8E), Linux/GCC, `dispatch/corpus -s 1024`, `unrar t`, n=7,
+medians, CRC cost isolated by subtracting a `UNRAR_CRC_SKIP=1` baseline.
 
-There is no buffer size at which pooling wins at folding speed, because 4 MB is
-the ceiling and 4 MB loses.
+**`rar5-store-m0`** — one 1 GiB stored file, 4 MB `Update()` calls, which is the
+largest unrar ever makes:
 
-x86-64 Linux, `dispatch/corpus -s 1024`, `UNRAR_CRC_FOLD=256`, n=9, medians:
+| CRC32 configuration | wall | CPU | rate |
+| --- | ---: | ---: | ---: |
+| slicing-by-16, pooled — *what ships today* | 90.5 ms | 385.3 ms | 11.9 GB/s |
+| slicing-by-16, calling thread | 233.3 ms | 234.2 ms | 4.6 GB/s |
+| `fold-256`, pooled | 53.8 ms | 145.0 ms | 20.0 GB/s |
+| **`fold-256`, calling thread** | **18.9 ms** | **19.3 ms** | **56.8 GB/s** |
 
-| archive | no CRC | CRC 1 thr | CRC pooled | pool vs 1 thr | iqr |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| rar5-store-m0 | 156.6 ms | 177.2 ms | 207.3 ms | **-17.0%** | 2.4% |
-| rar5-encrypted-m0 | 412.4 ms | 424.0 ms | 475.9 ms | **-12.2%** | 3.1% |
-| rar5-text-m5 | 852.9 ms | 878.8 ms | 912.8 ms | **-3.9%** | 1.8% |
-| rar5-encrypted | 915.7 ms | 946.9 ms | 968.8 ms | **-2.3%** | 1.7% |
-| rar5-vol.part01 | 2115.0 ms | 2189.9 ms | 2186.5 ms | +0.2% (noise) | 1.0% |
-| rar5-exe-m5 | 2122.6 ms | 2173.9 ms | 2179.0 ms | -0.2% (noise) | 1.4% |
-| rar5-many-m5 | 199.3 ms | 201.0 ms | 194.1 ms | +3.4% (noise) | 5.5% |
+From what ships today to the best row: **4.8x less wall clock and 20x less CPU.**
+And within the folding rows, pooling costs 7.5x the CPU to run 2.8x slower — so
+the answer to "should the pool be used when folding is available" is no, and by a
+wide margin.
 
-Nothing is faster with the pool. The two rows that lose most are the stored
-ones, where the CRC is 12% of the run and there is no other work to hide the
-overhead behind.
+The full table, both CRC implementations:
+
+| archive | `FOLD=0` pool vs 1 thr | `FOLD=256` pool vs 1 thr | CPU at `FOLD=256`, 1 thr → pool |
+| --- | ---: | ---: | ---: |
+| rar5-store-m0 | **+36.6%** | **-20.0%** | 19.3 → 145.0 ms |
+| rar5-encrypted-m0 | **+16.1%** | **-13.7%** | 21.0 → 171.1 ms |
+| rar5-text-m5 | **+13.4%** | **-2.4%** | 47.8 → 148.1 ms |
+| rar5-encrypted | **+10.8%** | **-2.8%** | 36.7 → 134.0 ms |
+| rar5-vol.part01 | +7.4% | -0.1% (noise) | 54.1 → 345.1 ms |
+| rar5-exe-m5 | +6.3% | -0.3% (noise) | 30.1 → 318.9 ms |
+| rar5-many-m5 | -1.6% (noise) | -1.4% (noise) | -1.0 → 1.8 ms |
+
+Positive means the pool is faster. With the table CRC the pool wins everywhere,
+by up to 37%. With folding it wins nowhere, and there is no larger buffer to
+retreat to.
+
+### The wall clock hides most of the cost
+
+The last column is the one that changes the argument. Look at `rar5-exe-m5` and
+`rar5-vol` at `FOLD=256`: the wall-clock difference is *noise*, and the pool is
+spending **10x and 6x the CPU** — an extra 289 and 291 core-milliseconds per run
+— to achieve nothing measurable. A compressed executable leaves most of the
+machine idle, so the pool's overhead lands in cores rather than in seconds and
+disappears from any wall-clock benchmark.
+
+This is not folding-specific. The same two rows at `FOLD=0`, i.e. unrar exactly
+as it ships: 237 → 506 ms and 278 → 576 ms of CPU, for +6.3% and +7.4% of wall
+clock. Whether that is a good trade depends entirely on whether unrar is the only
+thing running. For a CLI extracting an archive, plainly yes. For a library inside
+an application that is also downloading, verifying and repairing, the caller
+would very likely decline it — and cannot, see *No way to opt out* below.
+
+### Why this differs from the ~20-25 GB/s figure the pool is usually credited with
+
+unrar's own CRC benchmark ([crc.cpp:286](../crc.cpp), inside the `#if 0`
+`TestCRC()` block) loops `Hash.Update` 20,000 times over the *same* 1 MB buffer.
+That measures a buffer resident in L2 with each worker's slice already warm in
+that worker's cache, and it reports a much higher number than an extraction ever
+sees: on this machine the same pooled table path delivers **11.9 GB/s** inside
+`unrar t` against the 20-25 GB/s the resident loop reports.
+
+This is an easy mistake to make and not a criticism of that benchmark, which was
+written to compare CRC implementations rather than to model extraction — I made
+the same one here. `mtbench`'s producer model copied from a single small source
+buffer, so its whole working set stayed in L3, and it reported the pooled 4 MB
+case at 84 GB/s against the 21 GB/s `unrar t` measures. It now streams from a
+256 MB region. Any CRC benchmark that reuses one buffer will overstate the pool,
+because the pool's real cost is moving data between cores' caches and a resident
+buffer is already distributed.
+
+### No way to opt out
+
+A caller cannot decline the pool's CPU cost while keeping threaded
+decompression:
+
+- [extract.cpp:800](../extract.cpp) passes `Cmd->Threads` straight into
+  `DataHash::Init`, so the CRC pool gets the same thread count as everything else.
+- [options.cpp:23](../options.cpp) defaults it to `GetNumberOfThreads()`, i.e.
+  the core count, capped at `MaxPoolThreads`.
+- `-mt` ([cmddata.cpp:695](../cmddata.cpp)) is the only knob, and it also governs
+  unpack threading — so `-mt1` buys a cheap CRC at the price of single-threaded
+  decompression.
+- [dll.cpp](../dll.cpp) never sets `Cmd.Threads` at all, so libunrar always runs
+  the CRC pool at core count with no API to change it.
 
 ### The cost has two different shapes
 
-Comparing the `CRC pooled` and `CRC 1 thr` columns across rows, the overhead
-does not scale with one thing:
+The wall-clock and CPU overheads do not scale with the same thing, which is why
+no single row tells the whole story:
 
-- **On 2-4 MB calls it tracks bytes**, at roughly **30 ms per GB** (`store-m0`
-  +30.1 ms, `text-m5` +34.0 ms, both about 1 GB of output). That is the cost of
-  migrating seven eighths of each buffer out of the producing core's cache into
-  seven other cores' — work that did not exist when the CRC was the slow part.
-- **On the ~64 KB calls that filters produce it tracks call count**, at a few µs
-  each: `exe-m5` and `vol` decompress about as much as `text-m5` but pay only
-  ~5 ms, because a 64 KB buffer splits into 4 blocks rather than 8 and there is
-  little to migrate. On a 2.1 s run that disappears into the noise.
+- **In wall clock, on 2-4 MB calls, it tracks bytes**: `store-m0` +34.9 ms and
+  `text-m5` +21.0 ms per ~1 GB at `FOLD=256`. That is the cost of migrating seven
+  eighths of each buffer out of the producing core's cache into seven others' —
+  work that did not exist when the CRC was the slow part.
+- **In wall clock, on the ~64 KB calls filters produce, it nearly vanishes**:
+  `exe-m5` and `vol` decompress about as much as `text-m5` and show +7.0 and
+  +2.1 ms, inside noise, because they leave cores idle for the pool to use.
+- **In CPU it is large and roughly constant across all of them**: +126, +100,
+  +289 and +291 core-ms respectively. The pool spends about the same resources
+  whatever the buffer size; only its ability to convert them into wall clock
+  varies.
 
-Both are pure loss against a CRC that now costs 20 ms per GB in total.
+All of it is loss against a CRC that costs 19 ms per GB in total on one thread.
 
 ### What this corrected from the earlier, smaller runs
 
@@ -74,14 +136,19 @@ What holds up unchanged, from the 256 MB runs where the rows were long enough:
   wall clock on `mid256k` and `mid64k`, at 1.4-5.8% spread.
 - **The 32 KB threshold is too low even for the table CRC**: `mid64k` loses 5.1%
   at `FOLD=0`. That regression predates folding and ships today.
-- **The pool remains right for the table path** (+42% on stored data at
-  `FOLD=0`) and marginal for ARM's hardware crc32 (+29% on stored, -25 to -60%
-  on 32 KB - 512 KB calls). The threshold has to be a function of the CRC
-  implementation's rate.
+- **The pool remains right for the table path** (+36.6% on stored data at
+  `FOLD=0` on the i5-13500) and marginal for ARM's hardware crc32 (+29% on
+  stored, -25 to -60% on 32 KB - 512 KB calls). The threshold has to be a
+  function of the CRC implementation's rate.
 
-**Measured on**: x86-64 Linux/GCC for the folding tables (the same class of
-machine as `crcbench`'s ~4.1 / 37.7 / 50.0 GB/s figures) and Apple M2 Pro
-(8P+4E), macOS 15, Apple clang for the ARM ones.
+Note the mid-size arms are absent from the 1 GB tables above:
+`make-corpus.sh` deletes its output directory, so `add-midsize-corpus.sh` has to
+be re-run after regenerating. Their figures come from the 256 MB runs.
+
+**Measured on**: Intel i5-13500 (Raptor Lake, 6P+8E), Linux/GCC, for the folding
+tables, and Apple M2 Pro (8P+4E), macOS 15, Apple clang, for the ARM ones. The
+i5-13500's slicing-by-16 measures 4.6 GB/s single-threaded, against `crcbench`'s
+standalone 4.1 on comparable hardware.
 
 ### Dispatch cost is platform-specific, and it explains the ARM/x86 gap
 
