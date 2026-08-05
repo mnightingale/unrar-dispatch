@@ -168,9 +168,14 @@ Raspberry Pi 4 (Cortex-A72, aarch64/GCC), min-of-15, MB/s:
 | 4 MB | **701** | 532 | 406 | 418 |
 | 64 MB | **699** | 568 | 404 | 388 |
 
+Rebuilt with `-mcpu=cortex-a72+crc`, which is 1.37x faster on the table path (see
+*The flag spelling is worth more than 3x on its own* below), the regression
+survives: 1013 MB/s for the table against 830 for `braid-2` at 1 MB, so 0.82x. It
+is a property of the core, not of the codegen.
+
 **The idea works on wide cores and backfires on narrow ones.** 1.73x on the
-i5-13500, 2.09x on the M2 Pro, and **0.77x on a Cortex-A72**: a 23% regression at
-2 chains and 40% at 4. So braiding is not a portable win, and anything that ships
+i5-13500, 2.09x on the M2 Pro, and **0.82x on a Cortex-A72** with that core's own
+tuning flags, or 0.77x with the toolchain default. So braiding is not a portable win, and anything that ships
 it needs to know which core it is on.
 
 Two chains is the sweet spot wherever it helps at all; three and four are always
@@ -240,49 +245,78 @@ replicates only one:
    table needs 20 loads and thirty-odd ALU operations for. This is where the
    order of magnitude lives, and no amount of reordering reaches it.
 
-### The bigger ARM finding: the hardware CRC32 path is probably not compiled in
+### The bigger ARM finding: build flags, then the hardware CRC32 path
 
-Testing the Pi turned up something that matters more than braiding does.
+Testing the Pi turned up two things that matter more than braiding does.
 
 `USE_NEON_CRC32` is gated on `__ARM_FEATURE_CRC32` ([os.hpp:172](../os.hpp)),
 which is a **compile-time** macro. The runtime `HWCAP_CRC32` check inside
 `InitCRC32` ([crc.cpp:58](../crc.cpp)) only runs if the path was compiled in at
-all. And aarch64's baseline is `armv8-a`, where CRC32 is *optional* — it only
-became mandatory in ARMv8.1 — so GCC without an explicit `-march` does not define
-the macro.
-
-The consequence is that a plain `make` on many ARM systems silently ships the
-table path on hardware that has the instruction. The makefile's own ARM note
-mentions `-march=armv8-a+crypto` for AES and says nothing about `+crc`.
-
-`crcbench` now measures the NEON path and, more usefully, reports the mismatch.
-Built without the flag on a CPU that has the instruction:
+all. aarch64's baseline is `armv8-a`, where CRC32 is *optional*, becoming
+mandatory only in ARMv8.1, so a compiler without an explicit `-march` or `-mcpu`
+may not define the macro. `crcbench` reports that case rather than leaving it
+silent:
 
 ```
   neon-crc32     ARMv8 CRC32, what unrar uses CPU HAS IT, NOT COMPILED IN: add -march=armv8-a+crc
 ```
 
-What it is worth, measured on the M2 Pro where Apple clang defines the macro by
-default:
+#### The flag spelling is worth more than 3x on its own
 
-| | slicing-by-16 | `neon-crc32` |
-| ---: | ---: | ---: |
-| 1 MB | 3306 MB/s | **8299 MB/s** (2.51x) |
+Raspberry Pi 4, same source, same `-O2`, `slicing-by-16` at 1 MB:
 
-So on ARM the order of business is arguably: check the build reaches
-`neon-crc32` first, since that is a compiler flag rather than any new code, and
-only then consider braiding. On a Cortex-A72, where braiding is a 23% *loss*,
-the flag is the entire available win.
+| flags | slicing-by-16 | neon-crc32 |
+| --- | ---: | ---: |
+| default, no `-march` or `-mcpu` | 740 MB/s | not compiled in |
+| `-march=armv8-a+crc` | **276 MB/s** | 5290 MB/s |
+| `-mcpu=cortex-a72+crc` | **1013 MB/s** | 5260 MB/s |
 
-To measure it on a machine whose default build lacks the macro:
+**A 3.67x spread on the table path from flags alone**, with no source change. The
+`-march` spelling is 2.7x *slower* than the default, and `-mcpu` is 1.37x faster
+than it before any new instruction is enabled. An ARM benchmark of unrar that does
+not pin `-mcpu` is close to meaningless, which is worth knowing before trusting
+any ARM number, including the ones elsewhere in this directory.
 
-```bash
-make -f crcbench/makefile run CXXFLAGS='-O2 -std=c++11 -Wall -Wextra -march=armv8-a+crc'
-```
+**A retraction.** I first attributed the `-march` regression to Raspberry Pi OS
+shipping a GCC configured for `cortex-a72`, with `-march` resetting tuning to
+generic. The third row rules that out: if the default were already
+`-mcpu=cortex-a72`, adding it explicitly could not have gained 37%. The default is
+neither generic-tuned nor A72-tuned, and I cannot identify it from these numbers.
+`gcc -Q --help=target | grep -E 'march|mcpu|mtune'` on the Pi would say, and is
+the one loose end here. What survives is the measurement, which is the part that
+matters: the flag choice moves the table path by 3.67x in both directions, so it
+has to be measured per target rather than reasoned about.
 
-Worth confirming on the Pi: `grep -o crc32 /proc/cpuinfo | head -1` should show
-the CPU has it, and the unflagged `crcbench` line above should say it is not
-compiled in.
+#### What the instruction is worth, measured in one build
+
+With `-mcpu=cortex-a72+crc`, so both paths get identical codegen:
+
+| Pi 4 | slicing-by-16 | neon-crc32 | |
+| ---: | ---: | ---: | ---: |
+| 1 MB | 1013 MB/s | 5260 MB/s | **5.19x** |
+| 64 MB | 1021 MB/s | 3889 MB/s | 3.81x |
+
+At 1.5 GHz, 5260 MB/s is 3.5 bytes/cycle, about what a `crc32x` chain of 2-3
+cycle latency over 8 bytes allows, so it is latency-bound and near its own
+ceiling. The M2 Pro shows 2.51x (8299 against 3306), the smaller ratio there
+being a much faster table rather than a slower instruction.
+
+Note this **corrects the ~7x figure** in the previous revision, which compared
+neon from the `-march` build against the table from the default build. Two
+different builds, so not a real ratio. 5.19x is the honest number, and the
+correction only came out because the table path moved when the flags did.
+
+#### It also indicts advice already in the tree
+
+[makefile:6](../makefile) suggests `-march=armv8-a+crypto` to enable ARM NEON
+crypto. That has the same defect measured above: it would enable AES while
+changing the tuning underneath everything else, and on this Pi that direction was
+worth 2.7x the wrong way. `-mcpu=<core>+crypto+crc` gets both features and keeps
+the tuning.
+
+That is a documentation fix worth raising upstream on its own. It needs no new
+code, no runtime dispatch and no license discussion, and on a Pi 4 the two flags
+together are worth 5.19x on the CRC where braiding *loses* 18%.
 
 ### The implementation trap
 
