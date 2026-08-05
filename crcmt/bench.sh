@@ -110,14 +110,48 @@ if ! UNRAR_CRC_HIST=1 "$EXE" t -inul -p- -y "$PROBE" 2>&1 >/dev/null |
   exit 1
 fi
 
-if [ -z "$FOLDS" ]; then
-  if { objdump -d "$EXE" 2>/dev/null || otool -tv "$EXE" 2>/dev/null; } |
-     grep -qi pclmul; then
-    FOLDS="0 256"
+# What the CPU can actually reach, not what the binary contains. The
+# UNRAR_CRC_FOLD override can only narrow what CPUID detected, never widen it
+# (see crcfold.cpp), so asking for 256 on a CPU without VPCLMULQDQ silently runs
+# fold-128 while the table header claims otherwise. Sandy Bridge and Ivy Bridge
+# are precisely the parts where that matters: PCLMULQDQ yes, VPCLMULQDQ no.
+CEILING=unknown
+if [ -r /proc/cpuinfo ]; then
+  if grep -qm1 -w vpclmulqdq /proc/cpuinfo && grep -qm1 -w avx2 /proc/cpuinfo; then
+    CEILING=256
+  elif grep -qm1 -w pclmulqdq /proc/cpuinfo; then
+    CEILING=128
   else
-    FOLDS="native"
+    CEILING=0
   fi
 fi
+
+if [ -z "$FOLDS" ]; then
+  case $CEILING in
+    256) FOLDS="0 256" ;;
+    128) FOLDS="0 128"
+         echo "==> this CPU has PCLMULQDQ but not VPCLMULQDQ: comparing 0 vs 128" ;;
+    0)   FOLDS="native"
+         echo "==> this CPU has no PCLMULQDQ: only the table path exists" ;;
+    *)   if { objdump -d "$EXE" 2>/dev/null || otool -tv "$EXE" 2>/dev/null; } |
+            grep -qi pclmul; then
+           FOLDS="0 256"
+         else
+           FOLDS="native"
+         fi ;;
+  esac
+fi
+
+# An explicit -f can still ask for more than the CPU has. Say so rather than
+# mislabelling the run, since the numbers themselves would look plausible.
+for f in $FOLDS; do
+  case $CEILING in
+    128|0) [ "$f" = 256 ] && {
+      echo "!!! -f 256 requested but this CPU tops out at fold-$CEILING;" >&2
+      echo "    crcfold.cpp will clamp it, so that column would be mislabelled." >&2
+      exit 1; } ;;
+  esac
+done
 
 # Per-archive timing. Prints "min_ms median_ms iqr_pct median_cpu_ms".
 #
@@ -188,7 +222,7 @@ for fold in $FOLDS; do
     echo
     case $fold in
       0) echo "########  UNRAR_CRC_FOLD=0  (slicing-by-16 table)  ########" ;;
-      *) echo "########  UNRAR_CRC_FOLD=$fold  (${fold}-bit folding)  ########" ;;
+      *) echo "########  UNRAR_CRC_FOLD=$fold  (${fold}-bit folding, CPU ceiling ${CEILING})  ########" ;;
     esac
   fi
 
