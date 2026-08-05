@@ -421,7 +421,7 @@ one it took (via `CRCFoldWidth` and `CRC_Neon`):
 | slicing-by-16 | ~4.4 GB/s | 64 KB - 256 KB | `0x10000`-`0x20000` | bracketed by two corpus rows at `FOLD=0` |
 | ARM hw crc32 | ~8.7 GB/s | 256 KB - 1 MB | `0x80000` | bracketed, and `0x80000` verified end-to-end |
 | `fold-256` | 45-57 GB/s | above 4 MB, i.e. never | do not pool | `store-m0` at 1 GB loses 17.0% on 4 MB calls |
-| `fold-128` | 9.9-37.5 GB/s | above 4 MB at both ends measured | do not pool | 4250U loses 3.7-14.7%; top of the range untested |
+| `fold-128` | 9.9-37.5 GB/s | above 4 MB at both ends | do not pool | loses 5.2-14.1% at 9.9 GB/s and 2.6-14.1% at 37.5 |
 
 Evidence per row: at `FOLD=0`, `mid64k` loses 5.1% and `mid256k` wins 16.2%. On
 ARM, `mid256k` loses 25.4% and `mid1m` wins 20.1%, and raising `MinBlock` to
@@ -510,19 +510,56 @@ physical cores. CRC32 is port-bound in both implementations — 16 table loads p
 resources, only coherency traffic and another wakeup to wait on. That is part of
 why this machine loses so consistently, and it applies to the table path too.
 
-### Still untested: fast fold-128 on a many-core part
+### fold-128 at the top of its range: same answer
 
-`fold-128` spans 9.9 GB/s (Haswell-ULT) to 18.3 (Zen 3 5800X) to 37.5 (Raptor
-Lake), and only the bottom of that range has an end-to-end result. The middle
-and top are one command away on the i5-13500, since `UNRAR_CRC_FOLD=128` runs
-`fold-128` at 37.5 GB/s on 6P+8E:
+`fold-128` on the i5-13500 (37.5 GB/s, 6P+8E) behaves like `fold-256`, closing the
+last cell. Same machine, same 1 GB corpus, same run, n=7:
 
-```bash
-crcmt/bench.sh -c dispatch/corpus -f "0 128 256" -n 7
-```
+| archive | table | `fold-128` | `fold-256` |
+| --- | ---: | ---: | ---: |
+| rar5-store-m0 | **+37.9%** | **-14.1%** | **-17.1%** |
+| rar5-encrypted-m0 | **+18.0%** | **-11.5%** | **-17.7%** |
+| rar5-text-m5 | **+12.8%** | **-2.6%** | **-2.1%** |
+| rar5-encrypted | **+11.8%** | -1.6% (noise) | **-4.2%** |
+| rar5-vol.part01 | +8.2% | +0.7% (noise) | -0.1% (noise) |
+| rar5-exe-m5 | +6.1% | -0.5% (noise) | -0.8% (noise) |
 
-The expectation is that it looks like the `fold-256` column, since both are far
-above the rate where the pool can pay for itself. It would close the last cell.
+Positive means the pool is faster. So across everything measured:
+
+| CRC path | rate | cores | pool |
+| --- | ---: | ---: | --- |
+| slicing-by-16 | 2.2 GB/s | 2 | wins above ~512 KB, loses below |
+| slicing-by-16 | 4.6 GB/s | 14 | wins everywhere resolvable, to +37.9% |
+| ARM hw crc32 | 8.7 GB/s | 8 | wins above ~1 MB, loses below |
+| `fold-128` | 9.9 GB/s | 2 | loses, 5.2-14.1% |
+| `fold-128` | 37.5 GB/s | 14 | loses, 2.6-14.1% |
+| `fold-256` | 47-57 GB/s | 14 | loses, 2.1-17.7% |
+
+**No untested combination remains, and every folding row loses.** The rule is
+"folding is active, so do not pool", and it holds at both ends of `fold-128`'s
+4x rate range and at both extremes of core count.
+
+### Once you are folding, the width barely matters
+
+An aside, but a useful one for anyone deciding how much of this to adopt. On the
+same 1 GiB stored archive, CRC on the calling thread:
+
+| | CRC cost | rate | share of the saving vs the table |
+| --- | ---: | ---: | ---: |
+| slicing-by-16 | 238.0 ms | 4.5 GB/s | — |
+| `fold-128` | 26.1 ms | 41.1 GB/s | **98.4%** |
+| `fold-256` | 22.7 ms | 47.3 GB/s | 100% |
+
+`crcbench` puts `fold-256` 33% ahead of `fold-128` at 1 MB (50.0 against
+37.5 GB/s). End to end that difference is 4.4 ms of a 183 ms run — **2.4%** — and
+98% of the win is already banked by the 128-bit path.
+
+That matters because the 256-bit path carries all of the awkward parts: the
+`_MSC_VER >= 1920` gate, needing `PlatformToolset=v143` rather than the shipped
+`v140_xp`, and the VEX-containment check that has to be repeated after any
+toolchain upgrade ([crcbench/README.md](../crcbench/README.md)). `fold-128` needs
+SSE4.1 + PCLMULQDQ, builds on any MSVC, and has none of that. Shipping only
+`fold-128` would be a defensible choice that gives up 2%.
 
 ### Pre-Haswell is still untested, and probably does not matter now
 
