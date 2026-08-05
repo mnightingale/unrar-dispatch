@@ -110,98 +110,97 @@ if ! UNRAR_CRC_HIST=1 "$EXE" t -inul -p- -y "$PROBE" 2>&1 >/dev/null |
   exit 1
 fi
 
-# What the CPU can actually reach, not what the binary contains. The
-# UNRAR_CRC_FOLD override can only narrow what CPUID detected, never widen it
-# (see crcfold.cpp), so asking for 256 on a CPU without VPCLMULQDQ silently runs
-# fold-128 while the table header claims otherwise. Sandy Bridge and Ivy Bridge
-# are precisely the parts where that matters: PCLMULQDQ yes, VPCLMULQDQ no.
-CEILING=unknown
-if [ -r /proc/cpuinfo ]; then
-  if grep -qm1 -w vpclmulqdq /proc/cpuinfo && grep -qm1 -w avx2 /proc/cpuinfo; then
-    CEILING=256
-  elif grep -qm1 -w pclmulqdq /proc/cpuinfo; then
-    CEILING=128
+# Ask the binary which CRC32 path it actually took, for the given
+# UNRAR_CRC_FOLD. crcfold.cpp's override can only narrow what CPUID detected,
+# never widen it, so requesting 256 on a part with PCLMULQDQ and no VPCLMULQDQ
+# silently runs fold-128 - and a header claiming otherwise makes the whole table
+# say the wrong thing about the wrong implementation. Guessing this from
+# /proc/cpuinfo was the previous approach and it got exactly that case wrong.
+active_path() { # fold_mode -> e.g. "fold-128"
+  if [ "$1" = native ]; then
+    unset UNRAR_CRC_FOLD || true
   else
-    CEILING=0
+    UNRAR_CRC_FOLD=$1; export UNRAR_CRC_FOLD
   fi
-fi
+  UNRAR_CRC_HIST=1 "$EXE" t -inul -p- -y "$PROBE" 2>&1 >/dev/null |
+    sed -n 's/^CRC32 path: //p' | head -1
+}
 
 if [ -z "$FOLDS" ]; then
-  case $CEILING in
-    256) FOLDS="0 256" ;;
-    128) FOLDS="0 128"
-         echo "==> this CPU has PCLMULQDQ but not VPCLMULQDQ: comparing 0 vs 128" ;;
-    0)   FOLDS="native"
-         echo "==> this CPU has no PCLMULQDQ: only the table path exists" ;;
-    *)   if { objdump -d "$EXE" 2>/dev/null || otool -tv "$EXE" 2>/dev/null; } |
-            grep -qi pclmul; then
-           FOLDS="0 256"
-         else
-           FOLDS="native"
-         fi ;;
+  case $(active_path 256) in
+    fold-256) FOLDS="0 256" ;;
+    fold-128) FOLDS="0 128"
+              echo "==> this CPU has PCLMULQDQ but not VPCLMULQDQ: comparing 0 vs 128" ;;
+    *)        FOLDS="native"
+              echo "==> no folding available here: only the table path exists" ;;
   esac
 fi
+unset UNRAR_CRC_FOLD || true
 
-# An explicit -f can still ask for more than the CPU has. Say so rather than
-# mislabelling the run, since the numbers themselves would look plausible.
-for f in $FOLDS; do
-  case $CEILING in
-    128|0) [ "$f" = 256 ] && {
-      echo "!!! -f 256 requested but this CPU tops out at fold-$CEILING;" >&2
-      echo "    crcfold.cpp will clamp it, so that column would be mislabelled." >&2
-      exit 1; } ;;
-  esac
-done
-
-# Per-archive timing. Prints "min_ms median_ms iqr_pct median_cpu_ms".
+# Times all three modes for one archive, interleaved: one sample of each per
+# round rather than all N of one mode and then all N of the next. Sequential
+# blocks let any drift over the run - thermal on a fanless or low-TDP part,
+# turbo residency, page cache - land entirely on whichever mode goes last. On a
+# 15 W dual-core that showed up as CRC costs coming out negative, i.e. the
+# baseline measured slower than the run it was a floor for. The root bench.sh
+# alternates variant order for the same reason.
 #
-# Timing happens inside one python3 process; spawning an interpreter per sample
-# would add tens of milliseconds of noise.
-#
-# The verdict is decided on *medians*, not minima, and the noise band is the
-# interquartile spread. That is a deliberate change from dispatch/bench.sh,
-# which used min-of-N with (median-min)/min as its band: that band grows with N,
-# because more samples find a lower minimum while the median barely moves. A
-# row read as a solid result at -n 5 and as noise at -n 15 with no underlying
-# change, purely from that. Median and IQR are both stable in N, so two runs at
-# different -n are comparable. The minimum is still printed, since it is the
-# sample least polluted by scheduler interference and useful for reading rates
-# off, but nothing is decided on it.
+# Prints nine fields: median, iqr%, median cpu, for skip / 1-thread / pool.
+# Medians and interquartile spread rather than min-of-N with (median-min)/min:
+# that band grows with N, so the same row could read as a result at -n 5 and as
+# noise at -n 15 with nothing underlying changing.
 best_ms() {
   runs=$1; shift
   python3 -c '
-import resource, subprocess, sys, time
+import os, resource, subprocess, sys, time
 runs = int(sys.argv[1])
 cmd = [a for a in sys.argv[2:] if a]
-# One untimed warmup: the first read pulls the archive into page cache.
-subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-walls, cpus = [], []
-for _ in range(runs):
+MODES = (("UNRAR_CRC_SKIP", "1"), ("UNRAR_CRC_MT", "1"), (None, None))
+
+def run(mode):
+    env = dict(os.environ)
+    for name, _ in MODES:
+        if name:
+            env.pop(name, None)
+    name, value = mode
+    if name:
+        env[name] = value
     r0 = resource.getrusage(resource.RUSAGE_CHILDREN)
     t = time.perf_counter()
-    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    walls.append((time.perf_counter() - t) * 1000)
+    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                   env=env)
+    wall = (time.perf_counter() - t) * 1000
     r1 = resource.getrusage(resource.RUSAGE_CHILDREN)
-    cpus.append(((r1.ru_utime - r0.ru_utime) + (r1.ru_stime - r0.ru_stime)) * 1000)
+    cpu = ((r1.ru_utime - r0.ru_utime) + (r1.ru_stime - r0.ru_stime)) * 1000
+    return wall, cpu
 
-walls_s = sorted(walls)
-cpus_s = sorted(cpus)
+for mode in MODES:          # untimed warmup, so the page cache is not a factor
+    run(mode)
+
+walls = [[] for _ in MODES]
+cpus = [[] for _ in MODES]
+for _ in range(runs):
+    for i, mode in enumerate(MODES):
+        w, c = run(mode)
+        walls[i].append(w)
+        cpus[i].append(c)
 
 def pct(v, q):
+    v = sorted(v)
     if len(v) == 1:
         return v[0]
     i = (len(v) - 1) * q
     lo, hi = int(i), min(int(i) + 1, len(v) - 1)
     return v[lo] + (v[hi] - v[lo]) * (i - lo)
 
-med = pct(walls_s, 0.5)
-iqr = pct(walls_s, 0.75) - pct(walls_s, 0.25)
-# Median CPU rather than the CPU of the fastest run: the cpu columns are a
-# result in their own right, so they get the same robust statistic as the wall.
-print(round(walls_s[0], 1), round(med, 1),
-      round(iqr / med * 100, 1) if med else 0.0,
-      round(pct(cpus_s, 0.5), 1))
+out = []
+for i in range(len(MODES)):
+    med = pct(walls[i], 0.5)
+    iqr = pct(walls[i], 0.75) - pct(walls[i], 0.25)
+    out += [round(med, 1), round(iqr / med * 100, 1) if med else 0.0,
+            round(pct(cpus[i], 0.5), 1)]
+print(*out)
 ' "$runs" "$@"
 }
 
@@ -213,17 +212,20 @@ echo "runs per measurement: $RUNS   unrar flags: ${MTFLAG:-default threads}"
 echo "MinBlock: ${MINBLOCK:-0x4000 (default)}"
 
 for fold in $FOLDS; do
+  # PATH is what ran; $fold is only what was asked for. If they differ, say so
+  # rather than printing a header the numbers do not match.
+  ACTIVE=$(active_path "$fold")
   if [ "$fold" = native ]; then
     unset UNRAR_CRC_FOLD || true
-    echo
-    echo "########  native CRC32 (non-x86: ARM hw crc32 or the table)  ########"
   else
-    export UNRAR_CRC_FOLD=$fold
-    echo
-    case $fold in
-      0) echo "########  UNRAR_CRC_FOLD=0  (slicing-by-16 table)  ########" ;;
-      *) echo "########  UNRAR_CRC_FOLD=$fold  (${fold}-bit folding, CPU ceiling ${CEILING})  ########" ;;
-    esac
+    UNRAR_CRC_FOLD=$fold; export UNRAR_CRC_FOLD
+  fi
+  echo
+  if [ "$fold" != native ] && [ "$fold" != 0 ] &&
+     [ "$ACTIVE" != "fold-$fold" ]; then
+    echo "########  requested UNRAR_CRC_FOLD=$fold, THIS CPU RAN ${ACTIVE}  ########"
+  else
+    echo "########  CRC32 path: ${ACTIVE}  ########"
   fi
 
   printf '%-22s %8s %9s %9s   %9s %9s   %9s %9s   %7s %6s\n' \
@@ -240,18 +242,10 @@ for fold in $FOLDS; do
       *) pw="-p-" ;;
     esac
 
-    export UNRAR_CRC_SKIP=1
     set -- $(best_ms "$RUNS" "$EXE" t "$MTFLAG" "$pw" -y "$arc")
-    skipmed=$2; skipiqr=$3; skipcpu=$4
-    unset UNRAR_CRC_SKIP
-
-    export UNRAR_CRC_MT=1
-    set -- $(best_ms "$RUNS" "$EXE" t "$MTFLAG" "$pw" -y "$arc")
-    onemed=$2; oneiqr=$3; onecpu=$4
-    unset UNRAR_CRC_MT
-
-    set -- $(best_ms "$RUNS" "$EXE" t "$MTFLAG" "$pw" -y "$arc")
-    poolmed=$2; pooliqr=$3; poolcpu=$4
+    skipmed=$1; skipiqr=$2; skipcpu=$3
+    onemed=$4;  oneiqr=$5;  onecpu=$6
+    poolmed=$7; pooliqr=$8; poolcpu=$9
 
     printf '%-22s %7sms %8sms %8sms   ' \
       "$(basename "$arc" .rar)" "$skipmed" "$onemed" "$poolmed"

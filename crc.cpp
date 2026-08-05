@@ -94,6 +94,24 @@ static void InitTables()
 
 struct CallInitCRC {CallInitCRC() {InitTables();}} static CallInit32;
 
+
+#ifdef CRCMT_DIAG
+const char *CRC32ActivePath()
+{
+#ifdef USE_CRC_FOLD
+  if (CRCFoldWidth>=256)
+    return "fold-256";
+  if (CRCFoldWidth>=128)
+    return "fold-128";
+#endif
+#ifdef USE_NEON_CRC32
+  if (CRC_Neon)
+    return "neon-crc32";
+#endif
+  return "slicing-by-16";
+}
+#endif
+
 uint CRC32(uint StartCRC,const void *Addr,size_t Size)
 {
   byte *Data=(byte *)Addr;

@@ -89,7 +89,8 @@ struct CrcHistDump
     for (uint I=0;I<ASIZE(CrcHistBytes);I++)
       Total+=CrcHistBytes[I];
     // stderr, so it does not corrupt piped archive data on stdout.
-    fprintf(stderr,"\nDataHash::Update CRC32 call sizes\n");
+    fprintf(stderr,"\nCRC32 path: %s\n",CRC32ActivePath());
+    fprintf(stderr,"DataHash::Update CRC32 call sizes\n");
     fprintf(stderr,"%12s %10s %14s %8s\n","size >=","calls","bytes","% bytes");
     for (uint I=0;I<ASIZE(CrcHistCalls);I++)
       if (CrcHistCalls[I]!=0)
