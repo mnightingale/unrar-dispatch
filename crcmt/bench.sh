@@ -119,7 +119,7 @@ if [ -z "$FOLDS" ]; then
   fi
 fi
 
-# Per-archive timing. Prints "min_ms median_ms iqr_pct cpu_ms".
+# Per-archive timing. Prints "min_ms median_ms iqr_pct median_cpu_ms".
 #
 # Timing happens inside one python3 process; spawning an interpreter per sample
 # would add tens of milliseconds of noise.
@@ -151,8 +151,8 @@ for _ in range(runs):
     r1 = resource.getrusage(resource.RUSAGE_CHILDREN)
     cpus.append(((r1.ru_utime - r0.ru_utime) + (r1.ru_stime - r0.ru_stime)) * 1000)
 
-order = sorted(range(len(walls)), key=lambda i: walls[i])
-walls_s = [walls[i] for i in order]
+walls_s = sorted(walls)
+cpus_s = sorted(cpus)
 
 def pct(v, q):
     if len(v) == 1:
@@ -163,9 +163,11 @@ def pct(v, q):
 
 med = pct(walls_s, 0.5)
 iqr = pct(walls_s, 0.75) - pct(walls_s, 0.25)
+# Median CPU rather than the CPU of the fastest run: the cpu columns are a
+# result in their own right, so they get the same robust statistic as the wall.
 print(round(walls_s[0], 1), round(med, 1),
       round(iqr / med * 100, 1) if med else 0.0,
-      round(cpus[order[0]], 1))
+      round(pct(cpus_s, 0.5), 1))
 ' "$runs" "$@"
 }
 
@@ -190,9 +192,9 @@ for fold in $FOLDS; do
     esac
   fi
 
-  printf '%-22s %8s %9s %9s   %9s %9s %8s %7s %6s\n' \
-    archive no-CRC "CRC 1thr" "CRC pool" "cost 1thr" "cost pool" \
-    "pool" "cores" "iqr"
+  printf '%-22s %8s %9s %9s   %9s %9s   %9s %9s   %7s %6s\n' \
+    archive no-CRC "CRC 1thr" "CRC pool" "wall 1thr" "wall pool" \
+    "cpu 1thr" "cpu pool" "pool" "iqr"
 
   for arc in "$CORPUS"/*.rar; do
     case $(basename "$arc") in
@@ -206,12 +208,12 @@ for fold in $FOLDS; do
 
     export UNRAR_CRC_SKIP=1
     set -- $(best_ms "$RUNS" "$EXE" t "$MTFLAG" "$pw" -y "$arc")
-    skipmed=$2; skipiqr=$3
+    skipmed=$2; skipiqr=$3; skipcpu=$4
     unset UNRAR_CRC_SKIP
 
     export UNRAR_CRC_MT=1
     set -- $(best_ms "$RUNS" "$EXE" t "$MTFLAG" "$pw" -y "$arc")
-    onemed=$2; oneiqr=$3
+    onemed=$2; oneiqr=$3; onecpu=$4
     unset UNRAR_CRC_MT
 
     set -- $(best_ms "$RUNS" "$EXE" t "$MTFLAG" "$pw" -y "$arc")
@@ -220,7 +222,8 @@ for fold in $FOLDS; do
     printf '%-22s %7sms %8sms %8sms   ' \
       "$(basename "$arc" .rar)" "$skipmed" "$onemed" "$poolmed"
     python3 -c "
-skip, one, pool, cpu = $skipmed, $onemed, $poolmed, $poolcpu
+skip, one, pool = $skipmed, $onemed, $poolmed
+skipcpu, onecpu, poolcpu = $skipcpu, $onecpu, $poolcpu
 band = max($skipiqr, $oneiqr, $pooliqr)
 d = (one - pool) / one * 100
 verdict = 'noise' if abs(d) <= band else ('' if d > 0 else 'SLOWER')
@@ -228,7 +231,9 @@ verdict = 'noise' if abs(d) <= band else ('' if d > 0 else 'SLOWER')
 # says, so label it rather than letting it read as a measurement.
 if pool < 100:
     verdict = (verdict + ' short').strip()
-print(f'{one-skip:8.1f}ms {pool-skip:8.1f}ms {d:+7.1f}% {cpu/pool:7.2f} {band:5.1f}% {verdict}')"
+print(f'{one-skip:8.1f}ms {pool-skip:8.1f}ms   '
+      f'{onecpu-skipcpu:8.1f}ms {poolcpu-skipcpu:8.1f}ms   '
+      f'{d:+6.1f}% {band:5.1f}% {verdict}')"
   done
 done
 
